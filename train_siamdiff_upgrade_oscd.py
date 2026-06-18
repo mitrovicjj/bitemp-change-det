@@ -589,8 +589,6 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
         t2 = t2.to(device)
         mask = mask.to(device)
 
-        t1 = normalize_batch(t1)
-        t2 = normalize_batch(t2)
 
         if isinstance(model, SiamUnet_diff):
             logits = model(t1, t2)
