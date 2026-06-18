@@ -32,6 +32,8 @@ class OSCDDataset(Dataset):
         self.patch_size = patch_size
         self.crop_mode = crop_mode
         self.augment = augment
+        self.mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        self.std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
     def __len__(self):
         return len(self.ds)
@@ -39,7 +41,9 @@ class OSCDDataset(Dataset):
     def _to_tensor_image(self, image):
         arr = np.array(image, dtype=np.float32) / 255.0
         arr = np.transpose(arr, (2, 0, 1))
-        return torch.from_numpy(arr).float()
+        x = torch.from_numpy(arr).float()
+
+        return x
 
     def _to_tensor_mask(self, mask):
         arr = np.array(mask, dtype=np.float32)
@@ -65,6 +69,24 @@ class OSCDDataset(Dataset):
             x = F.pad(x, (0, pad_w, 0, pad_h), mode="constant", value=0)
 
         return x[:, top:top + ps, left:left + ps]
+
+    def _get_change_aware_crop(self, mask, h, w):
+        ps = self.patch_size
+
+        mask_np = np.array(mask).astype(np.float32)
+        change_coords = np.argwhere(mask_np > 0)
+
+        if len(change_coords) > 0 and random.random() < 0.3:
+            idx = random.randint(0, len(change_coords) - 1)
+            y, x = change_coords[idx]
+
+            top = max(0, min(y - ps // 2, h - ps))
+            left = max(0, min(x - ps // 2, w - ps))
+        else:
+            top = 0 if h <= ps else random.randint(0, h - ps)
+            left = 0 if w <= ps else random.randint(0, w - ps)
+
+        return top, left
 
     def _get_crop_coords(self, h, w):
         ps = self.patch_size
@@ -131,7 +153,8 @@ class OSCDDataset(Dataset):
         mask = self._to_tensor_mask(item["mask"])
 
         _, h, w = t1.shape
-        top, left = self._get_crop_coords(h, w)
+
+        top, left = self._get_change_aware_crop(mask, h, w)
 
         t1 = self._crop_with_pad(t1, top, left)
         t2 = self._crop_with_pad(t2, top, left)
@@ -139,5 +162,8 @@ class OSCDDataset(Dataset):
 
         if self.split == "train":
             t1, t2, mask = self._apply_augment(t1, t2, mask)
+
+        t1 = (t1 - self.mean) / self.std
+        t2 = (t2 - self.mean) / self.std
 
         return t1, t2, mask

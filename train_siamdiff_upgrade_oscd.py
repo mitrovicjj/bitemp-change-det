@@ -12,6 +12,7 @@ import mlflow
 import mlflow.pytorch
 from torch.nn.modules.padding import ReplicationPad2d
 from torch.utils.data import DataLoader
+import segmentation_models_pytorch as smp
 
 from src.oscd import OSCDDataset
 
@@ -267,120 +268,96 @@ class SiamUnet_diff(nn.Module):
             self.fuse1 = HybridDiffConcatFusion(32)
 
 
+    def encode(self, x):
+        x1 = self.do11(F.relu(self.bn11(self.conv11(x))))
+        x2 = self.do12(F.relu(self.bn12(self.conv12(x1))))
+        p1 = F.max_pool2d(x2, 2, 2)
+
+        x3 = self.do21(F.relu(self.bn21(self.conv21(p1))))
+        x4 = self.do22(F.relu(self.bn22(self.conv22(x3))))
+        p2 = F.max_pool2d(x4, 2, 2)
+
+        x5 = self.do31(F.relu(self.bn31(self.conv31(p2))))
+        x6 = self.do32(F.relu(self.bn32(self.conv32(x5))))
+        x7 = self.do33(F.relu(self.bn33(self.conv33(x6))))
+        p3 = F.max_pool2d(x7, 2, 2)
+
+        x8 = self.do41(F.relu(self.bn41(self.conv41(p3))))
+        x9 = self.do42(F.relu(self.bn42(self.conv42(x8))))
+        x10 = self.do43(F.relu(self.bn43(self.conv43(x9))))
+        p4 = F.max_pool2d(x10, 2, 2)
+
+        return x2, x4, x7, x10, p4
+
+
     def forward(self, x1, x2):
-        # Encoder branch for t1
-        x11 = self.do11(F.relu(self.bn11(self.conv11(x1))))
-        x12_1 = self.do12(F.relu(self.bn12(self.conv12(x11))))
-        x1p = F.max_pool2d(x12_1, kernel_size=2, stride=2)
+        # shared encoder (Siamese weight sharing)
+        f1_1, f1_2, f1_3, f1_4, f1_p = self.encode(x1)
+        f2_1, f2_2, f2_3, f2_4, f2_p = self.encode(x2)
 
-        x21 = self.do21(F.relu(self.bn21(self.conv21(x1p))))
-        x22_1 = self.do22(F.relu(self.bn22(self.conv22(x21))))
-        x2p = F.max_pool2d(x22_1, kernel_size=2, stride=2)
-
-        x31 = self.do31(F.relu(self.bn31(self.conv31(x2p))))
-        x32 = self.do32(F.relu(self.bn32(self.conv32(x31))))
-        x33_1 = self.do33(F.relu(self.bn33(self.conv33(x32))))
-        x3p = F.max_pool2d(x33_1, kernel_size=2, stride=2)
-
-        x41 = self.do41(F.relu(self.bn41(self.conv41(x3p))))
-        x42 = self.do42(F.relu(self.bn42(self.conv42(x41))))
-        x43_1 = self.do43(F.relu(self.bn43(self.conv43(x42))))
-        x4p = F.max_pool2d(x43_1, kernel_size=2, stride=2)
-
-        # Encoder branch for t2
-        x11 = self.do11(F.relu(self.bn11(self.conv11(x2))))
-        x12_2 = self.do12(F.relu(self.bn12(self.conv12(x11))))
-        x1p = F.max_pool2d(x12_2, kernel_size=2, stride=2)
-
-        x21 = self.do21(F.relu(self.bn21(self.conv21(x1p))))
-        x22_2 = self.do22(F.relu(self.bn22(self.conv22(x21))))
-        x2p = F.max_pool2d(x22_2, kernel_size=2, stride=2)
-
-        x31 = self.do31(F.relu(self.bn31(self.conv31(x2p))))
-        x32 = self.do32(F.relu(self.bn32(self.conv32(x31))))
-        x33_2 = self.do33(F.relu(self.bn33(self.conv33(x32))))
-        x3p = F.max_pool2d(x33_2, kernel_size=2, stride=2)
-
-        x41 = self.do41(F.relu(self.bn41(self.conv41(x3p))))
-        x42 = self.do42(F.relu(self.bn42(self.conv42(x41))))
-        x43_2 = self.do43(F.relu(self.bn43(self.conv43(x42))))
-        x4p = F.max_pool2d(x43_2, kernel_size=2, stride=2)
-
-        # Decoder
-        x4d = self.upconv4(x4p)
-        pad4 = ReplicationPad2d(
-            (0, x43_1.size(3) - x4d.size(3), 0, x43_1.size(2) - x4d.size(2))
-        )
+        # ---------------- Decoder ----------------
+        x = self.upconv4(f1_p - f2_p)
 
         if self.use_hybrid:
-            skip4 = self.fuse4(x43_1, x43_2)
+            skip4 = self.fuse4(f1_4, f2_4)
         else:
-            skip4 = torch.abs(x43_1 - x43_2)
+            skip4 = torch.abs(f1_4 - f2_4)
 
         if self.use_attention:
-            skip4 = self.att4(x4d, skip4)
+            skip4 = self.att4(x, skip4)
 
-        x4d = torch.cat((pad4(x4d), skip4), 1)
-        x43d = self.do43d(F.relu(self.bn43d(self.conv43d(x4d))))
-        x42d = self.do42d(F.relu(self.bn42d(self.conv42d(x43d))))
-        x41d = self.do41d(F.relu(self.bn41d(self.conv41d(x42d))))
+        x = torch.cat([x, skip4], dim=1)
+        x = self.do43d(F.relu(self.bn43d(self.conv43d(x))))
+        x = self.do42d(F.relu(self.bn42d(self.conv42d(x))))
+        x = self.do41d(F.relu(self.bn41d(self.conv41d(x))))
 
-        x3d = self.upconv3(x41d)
-        pad3 = ReplicationPad2d(
-            (0, x33_1.size(3) - x3d.size(3), 0, x33_1.size(2) - x3d.size(2))
-        )
+        # level 3
+        x = self.upconv3(x)
 
         if self.use_hybrid:
-            skip3 = self.fuse3(x33_1, x33_2)
+            skip3 = self.fuse3(f1_3, f2_3)
         else:
-            skip3 = torch.abs(x33_1 - x33_2)
+            skip3 = torch.abs(f1_3 - f2_3)
 
         if self.use_attention:
-            skip3 = self.att3(x3d, skip3)
+            skip3 = self.att3(x, skip3)
 
-        x3d = torch.cat((pad3(x3d), skip3), 1)
-        x33d = self.do33d(F.relu(self.bn33d(self.conv33d(x3d))))
-        x32d = self.do32d(F.relu(self.bn32d(self.conv32d(x33d))))
-        x31d = self.do31d(F.relu(self.bn31d(self.conv31d(x32d))))
+        x = torch.cat([x, skip3], dim=1)
+        x = self.do33d(F.relu(self.bn33d(self.conv33d(x))))
+        x = self.do32d(F.relu(self.bn32d(self.conv32d(x))))
+        x = self.do31d(F.relu(self.bn31d(self.conv31d(x))))
 
-
-        x2d = self.upconv2(x31d)
-        pad2 = ReplicationPad2d(
-            (0, x22_1.size(3) - x2d.size(3), 0, x22_1.size(2) - x2d.size(2))
-        )
+        # level 2
+        x = self.upconv2(x)
 
         if self.use_hybrid:
-            skip2 = self.fuse2(x22_1, x22_2)
+            skip2 = self.fuse2(f1_2, f2_2)
         else:
-            skip2 = torch.abs(x22_1 - x22_2)
+            skip2 = torch.abs(f1_2 - f2_2)
 
         if self.use_attention:
-            skip2 = self.att2(x2d, skip2)
+            skip2 = self.att2(x, skip2)
 
-        x2d = torch.cat((pad2(x2d), skip2), 1)
-        x22d = self.do22d(F.relu(self.bn22d(self.conv22d(x2d))))
-        x21d = self.do21d(F.relu(self.bn21d(self.conv21d(x22d))))
+        x = torch.cat([x, skip2], dim=1)
+        x = self.do22d(F.relu(self.bn22d(self.conv22d(x))))
+        x = self.do21d(F.relu(self.bn21d(self.conv21d(x))))
 
-
-        x1d = self.upconv1(x21d)
-        pad1 = ReplicationPad2d(
-            (0, x12_1.size(3) - x1d.size(3), 0, x12_1.size(2) - x1d.size(2))
-        )
+        # level 1
+        x = self.upconv1(x)
 
         if self.use_hybrid:
-            skip1 = self.fuse1(x12_1, x12_2)
+            skip1 = self.fuse1(f1_1, f2_1)
         else:
-            skip1 = torch.abs(x12_1 - x12_2)
+            skip1 = torch.abs(f1_1 - f2_1)
 
         if self.use_attention:
-            skip1 = self.att1(x1d, skip1)
+            skip1 = self.att1(x, skip1)
 
-        x1d = torch.cat((pad1(x1d), skip1), 1)
-        x12d = self.do12d(F.relu(self.bn12d(self.conv12d(x1d))))
-        x11d = self.conv11d(x12d)
+        x = torch.cat([x, skip1], dim=1)
+        x = self.do12d(F.relu(self.bn12d(self.conv12d(x))))
+        x = self.conv11d(x)
 
-        return x11d
-
+        return x
 
 # ---------------------------------------------------------------------------
 # Loss functions
@@ -467,7 +444,7 @@ def evaluate(model, loader, criterion, device, threshold=0.5, max_vis=3):
         t2 = t2.to(device)
         mask = mask.to(device)
 
-        if hasattr(model, "input_nbr"):
+        if getattr(model, "input_nbr", None) is not None:
             logits = model(t1, t2)
         else:
             x = torch.cat([t1, t2], dim=1)
@@ -521,6 +498,9 @@ def evaluate(model, loader, criterion, device, threshold=0.5, max_vis=3):
     fn_g = int(((y_pred == 0) & (y_true == 1)).sum())
     tn_g = int(((y_pred == 0) & (y_true == 0)).sum())
 
+    dice_global = (2 * tp_g + 1e-6) / (2 * tp_g + fp_g + fn_g + 1e-6)
+    iou_global = (tp_g + 1e-6) / (tp_g + fp_g + fn_g + 1e-6)
+
     n = max(batches, 1)
     return {
         "loss": total_loss / n,
@@ -532,30 +512,43 @@ def evaluate(model, loader, criterion, device, threshold=0.5, max_vis=3):
         "pixel_accuracy": total_pixel_acc / n,
         "confusion": {"tp": tp_g, "fp": fp_g, "fn": fn_g, "tn": tn_g},
         "vis_samples": vis_samples,
+        "dice_global": dice_global,
+        "iou_global": iou_global
     }
 
 
 # ---------------------------------------------------------------------------
 # Threshold sweep helper
 # ---------------------------------------------------------------------------
+def threshold_sweep(model, loader, criterion, device, thresholds=None):
+    if thresholds is None:
+        thresholds = np.arange(0.05, 0.95, 0.05)
 
-def threshold_sweep(model, loader, criterion, device, thresholds):
     results = []
+
     for thr in thresholds:
-        metrics = evaluate(model, loader, criterion, device, threshold=thr, max_vis=0)
-        results.append(
-            {
-                "threshold": thr,
-                "loss": metrics["loss"],
-                "f1": metrics["f1"],
-                "iou": metrics["iou"],
-                "dice": metrics["dice"],
-                "precision": metrics["precision"],
-                "recall": metrics["recall"],
-                "pixel_accuracy": metrics["pixel_accuracy"],
-            }
+        metrics = evaluate(
+            model,
+            loader,
+            criterion,
+            device,
+            threshold=thr,
+            max_vis=0
         )
-    return results
+
+        results.append({
+            "threshold": thr,
+            "dice": metrics["dice"],
+            "iou": metrics["iou"],
+            "f1": metrics["f1"],
+            "precision": metrics["precision"],
+            "recall": metrics["recall"],
+            "pixel_accuracy": metrics["pixel_accuracy"],
+        })
+
+    best = max(results, key=lambda x: (x["dice"] + x["iou"]) / 2)
+
+    return results, best
 
 
 # ---------------------------------------------------------------------------
@@ -596,7 +589,10 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
         t2 = t2.to(device)
         mask = mask.to(device)
 
-        if hasattr(model, "input_nbr"):
+        t1 = normalize_batch(t1)
+        t2 = normalize_batch(t2)
+
+        if isinstance(model, SiamUnet_diff):
             logits = model(t1, t2)
         else:
             x = torch.cat([t1, t2], dim=1)
@@ -692,7 +688,7 @@ def save_prediction_visuals(vis_samples, out_dir):
 
 def main(args):
     set_seed(args.seed)
-    device = torch.device("cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     out_dir = Path(args.output_dir)
@@ -706,13 +702,13 @@ def main(args):
     train_ds = OSCDDataset(
         split="train",
         patch_size=args.patch_size,
-        crop_mode=args.train_mode,
+        crop_mode="none",
         augment=args.augment,
     )
     val_ds = OSCDDataset(
         split="test",
         patch_size=args.patch_size,
-        crop_mode=args.val_mode,
+        crop_mode="none",
         augment="none",
     )
 
@@ -739,7 +735,15 @@ def main(args):
             use_hybrid=args.use_hybrid,
         ).to(device)
 
-    
+    elif args.model_name == "unet_resnet":
+        model = smp.Unet(
+        encoder_name="resnet34",
+        encoder_weights="imagenet",
+        in_channels=6,
+        classes=1,
+        activation=None
+    ).to(device)
+
     if args.loss_name == "dice":
         criterion = DiceLoss()
     elif args.loss_name == "bce_dice":
@@ -882,9 +886,13 @@ def main(args):
         model.load_state_dict(best_ckpt["model_state_dict"])
         model.eval()
 
+        results, best_thr = threshold_sweep(model, val_loader, criterion, device)
+        best_threshold = best_thr["threshold"]
+
         final_eval = evaluate(
             model, val_loader, criterion, device,
-            threshold=0.5, max_vis=3,
+            threshold=best_threshold,
+            max_vis=3,
         )
 
         curves_path = artifact_dir / "training_curves.png"
