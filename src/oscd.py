@@ -69,38 +69,34 @@ class OSCDDataset(Dataset):
             x = F.pad(x, (0, pad_w, 0, pad_h), mode="constant", value=0)
 
         return x[:, top:top + ps, left:left + ps]
-
-    def _get_change_aware_crop(self, mask, h, w):
+    
+    def _get_crop_coords(self, mask, h, w):
         ps = self.patch_size
 
-        mask_np = np.array(mask).astype(np.float32)
-        change_coords = np.argwhere(mask_np > 0)
-
-        if len(change_coords) > 0 and random.random() < 0.3:
-            idx = random.randint(0, len(change_coords) - 1)
-            y, x = change_coords[idx]
-
-            top = max(0, min(y - ps // 2, h - ps))
-            left = max(0, min(x - ps // 2, w - ps))
-        else:
-            top = 0 if h <= ps else random.randint(0, h - ps)
-            left = 0 if w <= ps else random.randint(0, w - ps)
-
-        return top, left
-
-    def _get_crop_coords(self, h, w):
-        ps = self.patch_size
-
+        # Validacija: uvijek isti crop, ponovljiv između epoha
         if self.crop_mode == "center_crop":
             top = max((h - ps) // 2, 0)
             left = max((w - ps) // 2, 0)
-        elif self.crop_mode == "random_crop":
-            top = 0 if h <= ps else random.randint(0, h - ps)
-            left = 0 if w <= ps else random.randint(0, w - ps)
-        else:
-            raise ValueError("Unsupported crop_mode")
+            return top, left
 
-        return top, left
+        # Train: 50% šanse da crop bude centriran oko stvarne promjene
+        if self.crop_mode == "random_crop":
+            mask_np = mask.squeeze(0).numpy()
+            ys, xs = np.where(mask_np > 0)
+
+            if len(xs) > 0 and random.random() < 0.5:
+                idx = random.randint(0, len(xs) - 1)
+                cy, cx = ys[idx], xs[idx]
+                top  = max(0, min(cy - ps // 2, h - ps))
+                left = max(0, min(cx - ps // 2, w - ps))
+                return top, left
+
+            top  = random.randint(0, max(h - ps, 0))
+            left = random.randint(0, max(w - ps, 0))
+            return top, left
+
+        raise ValueError(f"Unsupported crop_mode='{self.crop_mode}'")
+
 
     def _apply_sync_photometric(self, t1, t2):
         brightness = 1.0 + random.uniform(-0.15, 0.15)
@@ -154,7 +150,7 @@ class OSCDDataset(Dataset):
 
         _, h, w = t1.shape
 
-        top, left = 0, 0
+        top, left = self._get_crop_coords(mask, h, w)
 
         t1 = self._crop_with_pad(t1, top, left)
         t2 = self._crop_with_pad(t2, top, left)

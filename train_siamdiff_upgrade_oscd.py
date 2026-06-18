@@ -697,18 +697,9 @@ def main(args):
     mlflow.set_tracking_uri(args.mlflow_tracking_uri)
     mlflow.set_experiment(args.experiment_name)
 
-    train_ds = OSCDDataset(
-        split="train",
-        patch_size=args.patch_size,
-        crop_mode="none",
-        augment=args.augment,
-    )
-    val_ds = OSCDDataset(
-        split="test",
-        patch_size=args.patch_size,
-        crop_mode="none",
-        augment="none",
-    )
+    train_ds = OSCDDataset(split="train", patch_size=args.patch_size, crop_mode="random_crop", augment=args.augment)
+    val_ds   = OSCDDataset(split="test",  patch_size=args.patch_size, crop_mode="center_crop",   augment="none")
+
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers
@@ -741,6 +732,8 @@ def main(args):
         classes=1,
         activation=None
     ).to(device)
+    else:
+        raise ValueError(f"Unknown model_name: {args.model_name}")
 
     if args.loss_name == "dice":
         criterion = DiceLoss()
@@ -919,7 +912,7 @@ def main(args):
         mlflow.log_artifact(str(curves_path))
         mlflow.log_artifact(str(confusion_path))
         mlflow.log_artifacts(str(pred_dir), artifact_path="predictions")
-        mlflow.pytorch.log_model(model, artifact_path="model")
+        #mlflow.pytorch.log_model(model, artifact_path="model")
 
 
 # ---------------------------------------------------------------------------
@@ -928,7 +921,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Train U-Net or SiamDiff on OSCD RGB with MLflow logging (CPU only)"
+        description="Train U-Net or SiamDiff or pretrained resnet encoder on OSCD RGB with MLflow logging (CPU only)"
     )
 
     # Data
@@ -1008,7 +1001,7 @@ if __name__ == "__main__":
         "--model-name",
         type=str,
         default="unet",
-        choices=["unet", "siamdiff"]
+        choices=["unet", "siamdiff", "unet_resnet"]
     )
     parser.add_argument("--dataset-name", type=str, default="blanchon/OSCD_RGB")
     parser.add_argument("--mlflow-tracking-uri", type=str, default="file:./mlruns")
