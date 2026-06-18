@@ -752,7 +752,7 @@ def main(args):
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", patience=2, factor=0.5
+        optimizer, mode="min", patience=5, factor=0.5
     )
 
     best_path = out_dir / f"best_{args.model_name}_oscd.pt"

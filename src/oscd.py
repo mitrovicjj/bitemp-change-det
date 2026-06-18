@@ -21,6 +21,7 @@ class OSCDDataset(Dataset):
         patch_size=256,
         crop_mode="random_crop",
         augment="none",
+        num_crops_per_image=50,
     ):
         if augment not in self._VALID_AUGMENTS:
             raise ValueError(
@@ -34,9 +35,11 @@ class OSCDDataset(Dataset):
         self.augment = augment
         self.mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
         self.std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+        self.num_crops_per_image = num_crops_per_image if crop_mode == "random_crop" else 1
+
 
     def __len__(self):
-        return len(self.ds)
+        return len(self.ds) * self.num_crops_per_image
 
     def _to_tensor_image(self, image):
         arr = np.array(image, dtype=np.float32) / 255.0
@@ -142,7 +145,8 @@ class OSCDDataset(Dataset):
         return t1, t2, mask
 
     def __getitem__(self, idx):
-        item = self.ds[idx]
+        real_idx = idx % len(self.ds)   # mapira virtualni idx na pravu sliku
+        item = self.ds[real_idx]
 
         t1 = self._to_tensor_image(item["image1"])
         t2 = self._to_tensor_image(item["image2"])
