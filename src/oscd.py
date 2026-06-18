@@ -154,7 +154,7 @@ class OSCDDataset(Dataset):
 
         _, h, w = t1.shape
 
-        top, left = self._get_change_aware_crop(mask, h, w)
+        top, left = 0, 0
 
         t1 = self._crop_with_pad(t1, top, left)
         t2 = self._crop_with_pad(t2, top, left)
