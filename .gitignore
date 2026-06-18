@@ -1,6 +1,10 @@
 venv/
 checkpoints/
 mlruns/
+gis/
+polygons/
+reports/
+data/
 
 
 *.tiff

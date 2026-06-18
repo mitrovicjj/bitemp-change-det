@@ -7,6 +7,13 @@ import random
 
 
 class OSCDDataset(Dataset):
+    # Supported augment modes:
+    #   none– no augmentation
+    #   flip- random horizontal + vertical flip
+    #   flip_rot90– flip + random rot90 (k in {0,1,2,3})
+    #   strong– flip_rot90 + synchronised brightness/contrast/gamma
+    _VALID_AUGMENTS = {"none", "flip", "flip_rot90", "strong"}
+
     def __init__(
         self,
         split="train",
@@ -15,6 +22,11 @@ class OSCDDataset(Dataset):
         crop_mode="random_crop",
         augment="none",
     ):
+        if augment not in self._VALID_AUGMENTS:
+            raise ValueError(
+                f"Unsupported augment='{augment}'. "
+                f"Use one of: {sorted(self._VALID_AUGMENTS)}."
+            )
         self.split = split
         self.ds = load_dataset(hf_name)[split]
         self.patch_size = patch_size
@@ -64,18 +76,30 @@ class OSCDDataset(Dataset):
             top = 0 if h <= ps else random.randint(0, h - ps)
             left = 0 if w <= ps else random.randint(0, w - ps)
         else:
-            raise ValueError(
-                f"Unsupported crop_mode='{self.crop_mode}'. "
-                f"Use 'random_crop' or 'center_crop'."
-            )
+            raise ValueError("Unsupported crop_mode")
 
         return top, left
+
+    def _apply_sync_photometric(self, t1, t2):
+        brightness = 1.0 + random.uniform(-0.15, 0.15)
+        contrast = 1.0 + random.uniform(-0.15, 0.15)
+        gamma = 1.0 + random.uniform(-0.15, 0.15)
+
+        def _apply(x):
+            x = x * brightness
+            mean = x.mean(dim=(1, 2), keepdim=True)
+            x = (x - mean) * contrast + mean
+            x = torch.clamp(x, 1e-6, 1.0)
+            x = torch.pow(x, gamma)
+            return torch.clamp(x, 0.0, 1.0)
+
+        return _apply(t1), _apply(t2)
 
     def _apply_augment(self, t1, t2, mask):
         if self.augment == "none":
             return t1, t2, mask
 
-        if self.augment in {"flip", "flip_rot90"}:
+        if self.augment in {"flip", "flip_rot90", "strong"}:
             if random.random() < 0.5:
                 t1 = torch.flip(t1, dims=[2])
                 t2 = torch.flip(t2, dims=[2])
@@ -86,12 +110,16 @@ class OSCDDataset(Dataset):
                 t2 = torch.flip(t2, dims=[1])
                 mask = torch.flip(mask, dims=[1])
 
-        if self.augment == "flip_rot90":
+        if self.augment in {"flip_rot90", "strong"}:
             k = random.randint(0, 3)
             if k > 0:
                 t1 = torch.rot90(t1, k=k, dims=[1, 2])
                 t2 = torch.rot90(t2, k=k, dims=[1, 2])
                 mask = torch.rot90(mask, k=k, dims=[1, 2])
+
+        if self.augment == "strong":
+            if random.random() < 0.8:
+                t1, t2 = self._apply_sync_photometric(t1, t2)
 
         return t1, t2, mask
 

@@ -10,6 +10,7 @@ import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import mlflow
 import mlflow.pytorch
+from torch.nn.modules.padding import ReplicationPad2d
 from torch.utils.data import DataLoader
 
 from src.oscd import OSCDDataset
@@ -60,7 +61,9 @@ class UNet(nn.Module):
         self.bottleneck = DoubleConv(features[-1], features[-1] * 2)
 
         for feature in reversed(features):
-            self.ups.append(nn.ConvTranspose2d(feature * 2, feature, kernel_size=2, stride=2))
+            self.ups.append(
+                nn.ConvTranspose2d(feature * 2, feature, kernel_size=2, stride=2)
+            )
             self.ups.append(DoubleConv(feature * 2, feature))
 
         self.final_conv = nn.Conv2d(features[0], out_channels, kernel_size=1)
@@ -84,6 +87,299 @@ class UNet(nn.Module):
             x = self.ups[idx + 1](x)
 
         return self.final_conv(x)
+
+class DiceLoss(nn.Module):
+    def __init__(self, smooth=1e-6):
+        super().__init__()
+        self.smooth = smooth
+
+    def forward(self, logits, targets):
+        probs = torch.sigmoid(logits)
+        probs = probs.contiguous()
+        targets = targets.contiguous()
+
+        intersection = (probs * targets).sum(dim=(1, 2, 3))
+        union = probs.sum(dim=(1, 2, 3)) + targets.sum(dim=(1, 2, 3))
+        dice = (2.0 * intersection + self.smooth) / (union + self.smooth)
+        return 1.0 - dice.mean()
+
+
+class AttentionGate(nn.Module):
+    def __init__(self, gate_ch, skip_ch, inter_ch):
+        super().__init__()
+        self.W_g = nn.Sequential(
+            nn.Conv2d(gate_ch, inter_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(inter_ch),
+        )
+        self.W_x = nn.Sequential(
+            nn.Conv2d(skip_ch, inter_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(inter_ch),
+        )
+        self.psi = nn.Sequential(
+            nn.Conv2d(inter_ch, 1, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, g, x):
+        if g.shape[-2:] != x.shape[-2:]:
+            g = F.interpolate(g, size=x.shape[-2:], mode="bilinear", align_corners=False)
+        attn = self.relu(self.W_g(g) + self.W_x(x))
+        attn = self.psi(attn)
+        return x * attn
+
+
+class HybridDiffConcatFusion(nn.Module):
+    """
+    Kombinuje abs(f1-f2) i concat(f1,f2), pa vraća skip tensor iste širine
+    kao originalni diff branch.
+    """
+    def __init__(self, ch):
+        super().__init__()
+        self.fuse = nn.Sequential(
+            nn.Conv2d(ch * 3, ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, f1, f2):
+        diff = torch.abs(f1 - f2)           # [B, ch, H, W]
+        conc = torch.cat([f1, f2], dim=1)   # [B, 2ch, H, W]
+        x = torch.cat([diff, conc], dim=1)  # [B, 3ch, H, W]
+        return self.fuse(x)                 # [B, ch, H, W]
+    
+class SiamUnet_diff(nn.Module):
+    """SiamUnet_diff segmentation network adapted for binary change detection."""
+
+    def __init__(self, input_nbr, label_nbr=1, use_attention=True, use_hybrid=True):
+        super(SiamUnet_diff, self).__init__()
+
+        self.input_nbr = input_nbr
+        self.use_attention = use_attention
+        self.use_hybrid = use_hybrid
+
+        # ---------------- Encoder ----------------
+        self.conv11 = nn.Conv2d(input_nbr, 32, kernel_size=3, padding=1)
+        self.bn11 = nn.BatchNorm2d(32)
+        self.do11 = nn.Dropout2d(p=0.2)
+
+        self.conv12 = nn.Conv2d(32, 32, kernel_size=3, padding=1)
+        self.bn12 = nn.BatchNorm2d(32)
+        self.do12 = nn.Dropout2d(p=0.2)
+
+        self.conv21 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.bn21 = nn.BatchNorm2d(64)
+        self.do21 = nn.Dropout2d(p=0.2)
+
+        self.conv22 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
+        self.bn22 = nn.BatchNorm2d(64)
+        self.do22 = nn.Dropout2d(p=0.2)
+
+        self.conv31 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+        self.bn31 = nn.BatchNorm2d(128)
+        self.do31 = nn.Dropout2d(p=0.2)
+
+        self.conv32 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
+        self.bn32 = nn.BatchNorm2d(128)
+        self.do32 = nn.Dropout2d(p=0.2)
+
+        self.conv33 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
+        self.bn33 = nn.BatchNorm2d(128)
+        self.do33 = nn.Dropout2d(p=0.2)
+
+        self.conv41 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
+        self.bn41 = nn.BatchNorm2d(256)
+        self.do41 = nn.Dropout2d(p=0.2)
+
+        self.conv42 = nn.Conv2d(256, 256, kernel_size=3, padding=1)
+        self.bn42 = nn.BatchNorm2d(256)
+        self.do42 = nn.Dropout2d(p=0.2)
+
+        self.conv43 = nn.Conv2d(256, 256, kernel_size=3, padding=1)
+        self.bn43 = nn.BatchNorm2d(256)
+        self.do43 = nn.Dropout2d(p=0.2)
+
+        # ---------------- Decoder ----------------
+        self.upconv4 = nn.ConvTranspose2d(
+            256, 256, kernel_size=3, padding=1, stride=2, output_padding=1
+        )
+
+        self.conv43d = nn.ConvTranspose2d(512, 256, kernel_size=3, padding=1)
+        self.bn43d = nn.BatchNorm2d(256)
+        self.do43d = nn.Dropout2d(p=0.2)
+
+        self.conv42d = nn.ConvTranspose2d(256, 256, kernel_size=3, padding=1)
+        self.bn42d = nn.BatchNorm2d(256)
+        self.do42d = nn.Dropout2d(p=0.2)
+
+        self.conv41d = nn.ConvTranspose2d(256, 128, kernel_size=3, padding=1)
+        self.bn41d = nn.BatchNorm2d(128)
+        self.do41d = nn.Dropout2d(p=0.2)
+
+        self.upconv3 = nn.ConvTranspose2d(
+            128, 128, kernel_size=3, padding=1, stride=2, output_padding=1
+        )
+
+        self.conv33d = nn.ConvTranspose2d(256, 128, kernel_size=3, padding=1)
+        self.bn33d = nn.BatchNorm2d(128)
+        self.do33d = nn.Dropout2d(p=0.2)
+
+        self.conv32d = nn.ConvTranspose2d(128, 128, kernel_size=3, padding=1)
+        self.bn32d = nn.BatchNorm2d(128)
+        self.do32d = nn.Dropout2d(p=0.2)
+
+        self.conv31d = nn.ConvTranspose2d(128, 64, kernel_size=3, padding=1)
+        self.bn31d = nn.BatchNorm2d(64)
+        self.do31d = nn.Dropout2d(p=0.2)
+
+        self.upconv2 = nn.ConvTranspose2d(
+            64, 64, kernel_size=3, padding=1, stride=2, output_padding=1
+        )
+
+        self.conv22d = nn.ConvTranspose2d(128, 64, kernel_size=3, padding=1)
+        self.bn22d = nn.BatchNorm2d(64)
+        self.do22d = nn.Dropout2d(p=0.2)
+
+        self.conv21d = nn.ConvTranspose2d(64, 32, kernel_size=3, padding=1)
+        self.bn21d = nn.BatchNorm2d(32)
+        self.do21d = nn.Dropout2d(p=0.2)
+
+        self.upconv1 = nn.ConvTranspose2d(
+            32, 32, kernel_size=3, padding=1, stride=2, output_padding=1
+        )
+
+        self.conv12d = nn.ConvTranspose2d(64, 32, kernel_size=3, padding=1)
+        self.bn12d = nn.BatchNorm2d(32)
+        self.do12d = nn.Dropout2d(p=0.2)
+
+        self.conv11d = nn.ConvTranspose2d(32, label_nbr, kernel_size=3, padding=1)
+
+        if self.use_attention:
+            self.att4 = AttentionGate(gate_ch=256, skip_ch=256, inter_ch=128)
+            self.att3 = AttentionGate(gate_ch=128, skip_ch=128, inter_ch=64)
+            self.att2 = AttentionGate(gate_ch=64, skip_ch=64, inter_ch=32)
+            self.att1 = AttentionGate(gate_ch=32, skip_ch=32, inter_ch=16)
+
+        if self.use_hybrid:
+            self.fuse4 = HybridDiffConcatFusion(256)
+            self.fuse3 = HybridDiffConcatFusion(128)
+            self.fuse2 = HybridDiffConcatFusion(64)
+            self.fuse1 = HybridDiffConcatFusion(32)
+
+
+    def forward(self, x1, x2):
+        # Encoder branch for t1
+        x11 = self.do11(F.relu(self.bn11(self.conv11(x1))))
+        x12_1 = self.do12(F.relu(self.bn12(self.conv12(x11))))
+        x1p = F.max_pool2d(x12_1, kernel_size=2, stride=2)
+
+        x21 = self.do21(F.relu(self.bn21(self.conv21(x1p))))
+        x22_1 = self.do22(F.relu(self.bn22(self.conv22(x21))))
+        x2p = F.max_pool2d(x22_1, kernel_size=2, stride=2)
+
+        x31 = self.do31(F.relu(self.bn31(self.conv31(x2p))))
+        x32 = self.do32(F.relu(self.bn32(self.conv32(x31))))
+        x33_1 = self.do33(F.relu(self.bn33(self.conv33(x32))))
+        x3p = F.max_pool2d(x33_1, kernel_size=2, stride=2)
+
+        x41 = self.do41(F.relu(self.bn41(self.conv41(x3p))))
+        x42 = self.do42(F.relu(self.bn42(self.conv42(x41))))
+        x43_1 = self.do43(F.relu(self.bn43(self.conv43(x42))))
+        x4p = F.max_pool2d(x43_1, kernel_size=2, stride=2)
+
+        # Encoder branch for t2
+        x11 = self.do11(F.relu(self.bn11(self.conv11(x2))))
+        x12_2 = self.do12(F.relu(self.bn12(self.conv12(x11))))
+        x1p = F.max_pool2d(x12_2, kernel_size=2, stride=2)
+
+        x21 = self.do21(F.relu(self.bn21(self.conv21(x1p))))
+        x22_2 = self.do22(F.relu(self.bn22(self.conv22(x21))))
+        x2p = F.max_pool2d(x22_2, kernel_size=2, stride=2)
+
+        x31 = self.do31(F.relu(self.bn31(self.conv31(x2p))))
+        x32 = self.do32(F.relu(self.bn32(self.conv32(x31))))
+        x33_2 = self.do33(F.relu(self.bn33(self.conv33(x32))))
+        x3p = F.max_pool2d(x33_2, kernel_size=2, stride=2)
+
+        x41 = self.do41(F.relu(self.bn41(self.conv41(x3p))))
+        x42 = self.do42(F.relu(self.bn42(self.conv42(x41))))
+        x43_2 = self.do43(F.relu(self.bn43(self.conv43(x42))))
+        x4p = F.max_pool2d(x43_2, kernel_size=2, stride=2)
+
+        # Decoder
+        x4d = self.upconv4(x4p)
+        pad4 = ReplicationPad2d(
+            (0, x43_1.size(3) - x4d.size(3), 0, x43_1.size(2) - x4d.size(2))
+        )
+
+        if self.use_hybrid:
+            skip4 = self.fuse4(x43_1, x43_2)
+        else:
+            skip4 = torch.abs(x43_1 - x43_2)
+
+        if self.use_attention:
+            skip4 = self.att4(x4d, skip4)
+
+        x4d = torch.cat((pad4(x4d), skip4), 1)
+        x43d = self.do43d(F.relu(self.bn43d(self.conv43d(x4d))))
+        x42d = self.do42d(F.relu(self.bn42d(self.conv42d(x43d))))
+        x41d = self.do41d(F.relu(self.bn41d(self.conv41d(x42d))))
+
+        x3d = self.upconv3(x41d)
+        pad3 = ReplicationPad2d(
+            (0, x33_1.size(3) - x3d.size(3), 0, x33_1.size(2) - x3d.size(2))
+        )
+
+        if self.use_hybrid:
+            skip3 = self.fuse3(x33_1, x33_2)
+        else:
+            skip3 = torch.abs(x33_1 - x33_2)
+
+        if self.use_attention:
+            skip3 = self.att3(x3d, skip3)
+
+        x3d = torch.cat((pad3(x3d), skip3), 1)
+        x33d = self.do33d(F.relu(self.bn33d(self.conv33d(x3d))))
+        x32d = self.do32d(F.relu(self.bn32d(self.conv32d(x33d))))
+        x31d = self.do31d(F.relu(self.bn31d(self.conv31d(x32d))))
+
+
+        x2d = self.upconv2(x31d)
+        pad2 = ReplicationPad2d(
+            (0, x22_1.size(3) - x2d.size(3), 0, x22_1.size(2) - x2d.size(2))
+        )
+
+        if self.use_hybrid:
+            skip2 = self.fuse2(x22_1, x22_2)
+        else:
+            skip2 = torch.abs(x22_1 - x22_2)
+
+        if self.use_attention:
+            skip2 = self.att2(x2d, skip2)
+
+        x2d = torch.cat((pad2(x2d), skip2), 1)
+        x22d = self.do22d(F.relu(self.bn22d(self.conv22d(x2d))))
+        x21d = self.do21d(F.relu(self.bn21d(self.conv21d(x22d))))
+
+
+        x1d = self.upconv1(x21d)
+        pad1 = ReplicationPad2d(
+            (0, x12_1.size(3) - x1d.size(3), 0, x12_1.size(2) - x1d.size(2))
+        )
+
+        if self.use_hybrid:
+            skip1 = self.fuse1(x12_1, x12_2)
+        else:
+            skip1 = torch.abs(x12_1 - x12_2)
+
+        if self.use_attention:
+            skip1 = self.att1(x1d, skip1)
+
+        x1d = torch.cat((pad1(x1d), skip1), 1)
+        x12d = self.do12d(F.relu(self.bn12d(self.conv12d(x1d))))
+        x11d = self.conv11d(x12d)
+
+        return x11d
 
 
 # ---------------------------------------------------------------------------
@@ -134,12 +430,7 @@ class FocalLoss(nn.Module):
 
 
 class FocalDiceLoss(nn.Module):
-    """Weighted combination of FocalLoss and soft Dice loss.
-
-    focal_weight controls the Focal share; (1 - focal_weight) is the Dice share.
-    Default 0.3 gives more weight to Dice, which works well for low-prevalence
-    change-detection masks.
-    """
+    """Weighted combination of FocalLoss and soft Dice loss."""
 
     def __init__(self, focal_weight=0.3, alpha=0.25, gamma=2.0):
         super().__init__()
@@ -162,13 +453,6 @@ class FocalDiceLoss(nn.Module):
 
 @torch.no_grad()
 def evaluate(model, loader, criterion, device, threshold=0.5, max_vis=3):
-    """Run evaluation over loader.
-
-    Args:
-        threshold: Decision threshold applied to sigmoid probabilities.
-        max_vis:   Number of prediction visualisation samples to collect.
-                   Pass 0 to skip (e.g. during threshold sweep).
-    """
     model.eval()
     total_loss = total_iou = total_dice = 0.0
     total_precision = total_recall = total_f1 = total_pixel_acc = 0.0
@@ -182,9 +466,13 @@ def evaluate(model, loader, criterion, device, threshold=0.5, max_vis=3):
         t1 = t1.to(device)
         t2 = t2.to(device)
         mask = mask.to(device)
-        x = torch.cat([t1, t2], dim=1)
 
-        logits = model(x)
+        if hasattr(model, "input_nbr"):
+            logits = model(t1, t2)
+        else:
+            x = torch.cat([t1, t2], dim=1)
+            logits = model(x)
+
         loss = criterion(logits, mask)
         probs = torch.sigmoid(logits)
         preds = (probs > threshold).float()
@@ -252,11 +540,6 @@ def evaluate(model, loader, criterion, device, threshold=0.5, max_vis=3):
 # ---------------------------------------------------------------------------
 
 def threshold_sweep(model, loader, criterion, device, thresholds):
-    """Evaluate the model at each decision threshold; returns a list of dicts.
-
-    Visualisations are intentionally disabled (max_vis=0) because the same
-    model checkpoint is re-evaluated many times and we only care about metrics.
-    """
     results = []
     for thr in thresholds:
         metrics = evaluate(model, loader, criterion, device, threshold=thr, max_vis=0)
@@ -312,10 +595,14 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
         t1 = t1.to(device)
         t2 = t2.to(device)
         mask = mask.to(device)
-        x = torch.cat([t1, t2], dim=1)
+
+        if hasattr(model, "input_nbr"):
+            logits = model(t1, t2)
+        else:
+            x = torch.cat([t1, t2], dim=1)
+            logits = model(x)
 
         optimizer.zero_grad(set_to_none=True)
-        logits = model(x)
         loss = criterion(logits, mask)
         loss.backward()
         optimizer.step()
@@ -382,11 +669,16 @@ def save_prediction_visuals(vis_samples, out_dir):
         prob = sample["prob"].squeeze(0).numpy()
 
         fig, axes = plt.subplots(1, 5, figsize=(18, 4))
-        axes[0].imshow(np.clip(t1, 0, 1)); axes[0].set_title("T1")
-        axes[1].imshow(np.clip(t2, 0, 1)); axes[1].set_title("T2")
-        axes[2].imshow(mask, cmap="gray"); axes[2].set_title("GT Mask")
-        axes[3].imshow(prob, cmap="viridis"); axes[3].set_title("Pred Prob")
-        axes[4].imshow(pred, cmap="gray"); axes[4].set_title("Pred Mask")
+        axes[0].imshow(np.clip(t1, 0, 1))
+        axes[0].set_title("T1")
+        axes[1].imshow(np.clip(t2, 0, 1))
+        axes[1].set_title("T2")
+        axes[2].imshow(mask, cmap="gray")
+        axes[2].set_title("GT Mask")
+        axes[3].imshow(prob, cmap="viridis")
+        axes[3].set_title("Pred Prob")
+        axes[4].imshow(pred, cmap="gray")
+        axes[4].set_title("Pred Mask")
         for ax in axes:
             ax.axis("off")
         plt.tight_layout()
@@ -431,10 +723,26 @@ def main(args):
         val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers
     )
 
-    model = UNet(in_channels=6, out_channels=1, features=(32, 64, 128, 256)).to(device)
+    if args.model_name == "unet":
+        model = UNet(
+            in_channels=6,
+            out_channels=1,
+            features=(32, 64, 128, 256)
+        ).to(device)
 
-    # Loss selector
-    if args.loss_name == "bce_dice":
+
+    elif args.model_name == "siamdiff":
+        model = SiamUnet_diff(
+            input_nbr=3,
+            label_nbr=1,
+            use_attention=args.use_attention,
+            use_hybrid=args.use_hybrid,
+        ).to(device)
+
+    
+    if args.loss_name == "dice":
+        criterion = DiceLoss()
+    elif args.loss_name == "bce_dice":
         criterion = BCEDiceLoss(bce_weight=args.bce_weight)
     elif args.loss_name == "focal_dice":
         criterion = FocalDiceLoss(
@@ -444,7 +752,7 @@ def main(args):
         )
     else:
         raise ValueError(
-            f"Unsupported loss_name='{args.loss_name}'. Use 'bce_dice' or 'focal_dice'."
+            f"Unsupported loss_name='{args.loss_name}'. Use 'dice', 'bce_dice' or 'focal_dice'."
         )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -452,8 +760,8 @@ def main(args):
         optimizer, mode="min", patience=2, factor=0.5
     )
 
-    best_path = out_dir / "best_unet_oscd.pt"
-    last_path = out_dir / "last_unet_oscd.pt"
+    best_path = out_dir / f"best_{args.model_name}_oscd.pt"
+    last_path = out_dir / f"last_{args.model_name}_oscd.pt"
 
     history = {"epoch": [], "train_loss": [], "val_loss": [], "val_iou": [], "val_dice": []}
     best_val_loss = float("inf")
@@ -489,6 +797,8 @@ def main(args):
                 "seed": args.seed,
                 "model_name": args.model_name,
                 "dataset_name": args.dataset_name,
+                "use_attention": args.use_attention,
+                "use_hybrid": args.use_hybrid,
             }
         )
 
@@ -497,7 +807,6 @@ def main(args):
         epoch = 0
         for epoch in range(1, args.epochs + 1):
             train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
-            # During training loop: no visualisations needed, default threshold
             val_metrics = evaluate(model, val_loader, criterion, device, max_vis=0)
             scheduler.step(val_metrics["loss"])
             lr_now = optimizer.param_groups[0]["lr"]
@@ -543,7 +852,7 @@ def main(args):
             }
             torch.save(checkpoint, last_path)
 
-            if val_metrics["loss"] < best_val_loss:
+            if val_metrics["dice"] > best_val_dice:
                 best_val_loss = val_metrics["loss"]
                 best_val_iou = val_metrics["iou"]
                 best_val_dice = val_metrics["dice"]
@@ -569,10 +878,10 @@ def main(args):
             }
         )
 
-        # Final evaluation on best checkpoint (with visualisations)
         best_ckpt = torch.load(best_path, map_location=device)
         model.load_state_dict(best_ckpt["model_state_dict"])
         model.eval()
+
         final_eval = evaluate(
             model, val_loader, criterion, device,
             threshold=0.5, max_vis=3,
@@ -586,7 +895,6 @@ def main(args):
         save_confusion_matrix(final_eval["confusion"], confusion_path)
         save_prediction_visuals(final_eval["vis_samples"], pred_dir)
 
-        # Optional threshold sweep after final evaluation
         if args.do_threshold_sweep:
             sweep_results = threshold_sweep(
                 model, val_loader, criterion, device,
@@ -614,7 +922,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Train U-Net on OSCD RGB with MLflow logging (CPU only)"
+        description="Train U-Net or SiamDiff on OSCD RGB with MLflow logging (CPU only)"
     )
 
     # Data
@@ -636,14 +944,16 @@ if __name__ == "__main__":
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--use-attention", action="store_true")
+    parser.add_argument("--use-hybrid", action="store_true")
 
     # Loss
     parser.add_argument(
         "--loss-name",
         type=str,
         default="bce_dice",
-        choices=["bce_dice", "focal_dice"],
-        help="Loss function: bce_dice | focal_dice",
+        choices=["dice", "bce_dice", "focal_dice"],
+        help="Loss function: bce_dice | focal_dice | dice",
     )
     parser.add_argument(
         "--bce-weight",
@@ -688,7 +998,12 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", type=str, default="checkpoints")
     parser.add_argument("--experiment-name", type=str, default="oscd_change_detection")
     parser.add_argument("--run-name", type=str, default="baseline_unet_cpu")
-    parser.add_argument("--model-name", type=str, default="unet")
+    parser.add_argument(
+        "--model-name",
+        type=str,
+        default="unet",
+        choices=["unet", "siamdiff"]
+    )
     parser.add_argument("--dataset-name", type=str, default="blanchon/OSCD_RGB")
     parser.add_argument("--mlflow-tracking-uri", type=str, default="file:./mlruns")
 
