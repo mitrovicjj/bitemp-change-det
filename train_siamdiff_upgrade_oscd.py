@@ -791,6 +791,13 @@ def save_prediction_visuals(vis_samples, out_dir):
 # ---------------------------------------------------------------------------
 
 def build_model(args, device):
+    if args.mode == "finetune":
+        if args.checkpoint_path is None:
+            raise ValueError("--checkpoint-path je obavezan za finetune")
+
+        model = load_checkpoint(model, args.checkpoint_path, device)
+        print("DEBUG FINETUNE: checkpoint loaded")
+    
     if args.model_name == "unet":
         model = UNet(
             in_channels=6,
