@@ -875,7 +875,7 @@ def main(args):
                 print(
                     f"Early stopping at epoch {epoch:03d}. "
                     f"Best epoch: {early_stopping.best_epoch:03d}, "
-                    f"val_loss={early_stopping.best_loss:.4f}"
+                    f"val_negative_dice={early_stopping.best_loss:.4f}"
                 )
                 break
 
