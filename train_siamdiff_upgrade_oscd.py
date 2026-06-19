@@ -25,8 +25,9 @@ def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-
-
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
@@ -367,7 +368,7 @@ class BCEDiceLoss(nn.Module):
     def __init__(self, bce_weight=0.5, pos_weight=None):
         super().__init__()
         if pos_weight is not None:
-            self.bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight))
+            self.bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
         else:
             self.bce = nn.BCEWithLogitsLoss()
         self.bce_weight = bce_weight
@@ -689,6 +690,8 @@ def save_prediction_visuals(vis_samples, out_dir):
 
 def main(args):
     set_seed(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
@@ -704,20 +707,38 @@ def main(args):
     val_ds   = OSCDDataset(split="test",  patch_size=args.patch_size, crop_mode="center_crop",   augment="none", num_crops_per_image=1)
 
 
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+
     train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        generator=g,
+        drop_last=True
     )
+
     val_loader = DataLoader(
-        val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
     )
 
     pos_count = 0
-    neg_count = 0
+    total_count = 0
 
-    for t1, t2, mask in train_loader:
+    for i in range(len(train_ds)):
+        _, _, mask = train_ds[i]
         pos_count += mask.sum().item()
-        neg_count += (mask.numel() - mask.sum().item())
-    pos_weight = neg_count / pos_count if pos_count > 0 else 1.0
+        total_count += mask.numel()
+
+    neg_count = total_count - pos_count
+
+    eps = 1e-6
+    pos_weight = np.sqrt((neg_count + eps) / (pos_count + eps))
+    pos_weight = float(np.clip(pos_weight, 1.0, 10.0))
 
     print(f"Class balance: pos={pos_count}, neg={neg_count}, pos_weight={pos_weight:.2f}")
 
@@ -748,12 +769,15 @@ def main(args):
     else:
         raise ValueError(f"Unknown model_name: {args.model_name}")
 
+    pos_weight_tensor = torch.tensor(pos_weight, device=device)
+
+
     if args.loss_name == "dice":
         criterion = DiceLoss()
     elif args.loss_name == "bce_dice":
         criterion = BCEDiceLoss(
             bce_weight=args.bce_weight,
-            pos_weight=pos_weight
+            pos_weight=pos_weight_tensor
         )
     elif args.loss_name == "focal_dice":
         criterion = FocalDiceLoss(
@@ -768,7 +792,7 @@ def main(args):
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", patience=5, factor=0.5
+        optimizer, mode="max", patience=5, factor=0.5
     )
 
     best_path = out_dir / f"best_{args.model_name}_oscd.pt"
@@ -813,13 +837,14 @@ def main(args):
             }
         )
 
-        early_stopping = EarlyStopping(patience=5, min_delta=0.001)
+        early_stopping = EarlyStopping(patience=7, min_delta=0.002)
 
         epoch = 0
+        best_score = -1.0
         for epoch in range(1, args.epochs + 1):
             train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
             val_metrics = evaluate(model, val_loader, criterion, device, max_vis=0)
-            scheduler.step(val_metrics["loss"])
+            scheduler.step(val_metrics["dice"])
             lr_now = optimizer.param_groups[0]["lr"]
 
             print(
@@ -863,7 +888,9 @@ def main(args):
             }
             torch.save(checkpoint, last_path)
 
-            if val_metrics["dice"] > best_val_dice:
+            score = (val_metrics["dice"] + val_metrics["iou"]) / 2
+            if score > best_score:
+                best_score = score
                 best_val_loss = val_metrics["loss"]
                 best_val_iou = val_metrics["iou"]
                 best_val_dice = val_metrics["dice"]
@@ -871,7 +898,7 @@ def main(args):
                 torch.save(checkpoint, best_path)
                 print(f"  => Saved new best model (epoch {epoch})")
 
-            if early_stopping.step(-val_metrics["dice"], epoch):
+            if early_stopping.step(val_metrics["dice"], epoch):
                 print(
                     f"Early stopping at epoch {epoch:03d}. "
                     f"Best epoch: {early_stopping.best_epoch:03d}, "
