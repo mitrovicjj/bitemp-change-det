@@ -21,7 +21,7 @@ class OSCDDataset(Dataset):
         patch_size=256,
         crop_mode="random_crop",
         augment="none",
-        num_crops_per_image=50,
+        num_crops_per_image=20,
     ):
         if augment not in self._VALID_AUGMENTS:
             raise ValueError(

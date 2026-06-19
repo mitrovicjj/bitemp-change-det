@@ -364,9 +364,12 @@ class SiamUnet_diff(nn.Module):
 # ---------------------------------------------------------------------------
 
 class BCEDiceLoss(nn.Module):
-    def __init__(self, bce_weight=0.5):
+    def __init__(self, bce_weight=0.5, pos_weight=None):
         super().__init__()
-        self.bce = nn.BCEWithLogitsLoss()
+        if pos_weight is not None:
+            self.bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight, device=device))
+        else:
+            self.bce = nn.BCEWithLogitsLoss()
         self.bce_weight = bce_weight
 
     def forward(self, logits, targets):
@@ -377,7 +380,7 @@ class BCEDiceLoss(nn.Module):
         union = probs.sum(dim=(1, 2, 3)) + targets.sum(dim=(1, 2, 3))
         dice_loss = 1.0 - ((2.0 * intersection + smooth) / (union + smooth)).mean()
         return self.bce_weight * bce + (1.0 - self.bce_weight) * dice_loss
-
+    
 
 class FocalLoss(nn.Module):
     """Binary focal loss computed directly from logits (numerically stable)."""
@@ -697,8 +700,8 @@ def main(args):
     mlflow.set_tracking_uri(args.mlflow_tracking_uri)
     mlflow.set_experiment(args.experiment_name)
 
-    train_ds = OSCDDataset(split="train", patch_size=args.patch_size, crop_mode="random_crop", augment=args.augment)
-    val_ds   = OSCDDataset(split="test",  patch_size=args.patch_size, crop_mode="center_crop",   augment="none")
+    train_ds = OSCDDataset(split="train", patch_size=args.patch_size, crop_mode="random_crop", augment=args.augment, num_crops_per_image=20)
+    val_ds   = OSCDDataset(split="test",  patch_size=args.patch_size, crop_mode="center_crop",   augment="none", num_crops_per_image=1)
 
 
     train_loader = DataLoader(
@@ -707,6 +710,16 @@ def main(args):
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers
     )
+
+    pos_count = 0
+    neg_count = 0
+
+    for t1, t2, mask in train_loader:
+        pos_count += mask.sum().item()
+        neg_count += (mask.numel() - mask.sum().item())
+    pos_weight = neg_count / pos_count if pos_count > 0 else 1.0
+
+    print(f"Class balance: pos={pos_count}, neg={neg_count}, pos_weight={pos_weight:.2f}")
 
     if args.model_name == "unet":
         model = UNet(
@@ -738,7 +751,10 @@ def main(args):
     if args.loss_name == "dice":
         criterion = DiceLoss()
     elif args.loss_name == "bce_dice":
-        criterion = BCEDiceLoss(bce_weight=args.bce_weight)
+        criterion = BCEDiceLoss(
+            bce_weight=args.bce_weight,
+            pos_weight=pos_weight
+        )
     elif args.loss_name == "focal_dice":
         criterion = FocalDiceLoss(
             focal_weight=args.focal_weight,
@@ -797,7 +813,7 @@ def main(args):
             }
         )
 
-        early_stopping = EarlyStopping(patience=10, min_delta=0.001)
+        early_stopping = EarlyStopping(patience=5, min_delta=0.001)
 
         epoch = 0
         for epoch in range(1, args.epochs + 1):
@@ -855,7 +871,7 @@ def main(args):
                 torch.save(checkpoint, best_path)
                 print(f"  => Saved new best model (epoch {epoch})")
 
-            if early_stopping.step(val_metrics["loss"], epoch):
+            if early_stopping.step(-val_metrics["dice"], epoch):
                 print(
                     f"Early stopping at epoch {epoch:03d}. "
                     f"Best epoch: {early_stopping.best_epoch:03d}, "
