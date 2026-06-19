@@ -13,7 +13,7 @@ import mlflow.pytorch
 from torch.nn.modules.padding import ReplicationPad2d
 from torch.utils.data import DataLoader
 import segmentation_models_pytorch as smp
-
+from src.local import LocalChangeDataset
 from src.oscd import OSCDDataset
 
 
@@ -28,6 +28,18 @@ def set_seed(seed: int):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+def load_checkpoint(model, checkpoint_path, device):
+    ckpt = torch.load(checkpoint_path, map_location=device)
+
+    if "model_state_dict" in ckpt:
+        state_dict = ckpt["model_state_dict"]
+    else:
+        state_dict = ckpt
+
+    model.load_state_dict(state_dict, strict=True)
+    print(f"Loaded checkpoint: {checkpoint_path}")
+    return model
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
@@ -427,7 +439,68 @@ class FocalDiceLoss(nn.Module):
         dice_loss = 1.0 - ((2.0 * intersection + smooth) / (union + smooth)).mean()
         return self.focal_weight * focal_loss + (1.0 - self.focal_weight) * dice_loss
 
+# ---------------------------------------------------------------------------
+# Zero-shot
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def run_zeroshot_and_save(model, loader, device, save_dir, threshold=0.5):
+    model.eval()
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
 
+    sample_idx = 0
+
+    for t1, t2, mask in loader:
+        t1 = t1.to(device)
+        t2 = t2.to(device)
+
+        if getattr(model, "input_nbr", None) is not None:
+            logits = model(t1, t2)
+        else:
+            x = torch.cat([t1, t2], dim=1)
+            logits = model(x)
+
+        probs = torch.sigmoid(logits)
+        preds = (probs > threshold).float()
+
+        for i in range(t1.size(0)):
+            sample_idx += 1
+
+            prob_np = probs[i].squeeze().cpu().numpy()
+            pred_np = preds[i].squeeze().cpu().numpy()
+
+            np.save(save_dir / f"sample_{sample_idx:04d}_prob.npy", prob_np)
+            np.save(save_dir / f"sample_{sample_idx:04d}_pred.npy", pred_np)
+
+            fig, axes = plt.subplots(1, 4, figsize=(14, 4))
+
+            t1_img = t1[i].detach().cpu()
+            t2_img = t2[i].detach().cpu()
+
+            if t1_img.shape[0] == 3:
+                t1_img = t1_img.permute(1, 2, 0).numpy()
+                t2_img = t2_img.permute(1, 2, 0).numpy()
+                axes[0].imshow(np.clip(t1_img, 0, 1))
+                axes[1].imshow(np.clip(t2_img, 0, 1))
+            else:
+                axes[0].imshow(t1_img[0].numpy(), cmap="gray")
+                axes[1].imshow(t2_img[0].numpy(), cmap="gray")
+
+            axes[0].set_title("T1")
+            axes[1].set_title("T2")
+            axes[2].imshow(prob_np, cmap="viridis")
+            axes[2].set_title("Prob")
+            axes[3].imshow(pred_np, cmap="gray")
+            axes[3].set_title("Pred")
+
+            for ax in axes:
+                ax.axis("off")
+
+            plt.tight_layout()
+            fig.savefig(save_dir / f"sample_{sample_idx:04d}.png", dpi=150, bbox_inches="tight")
+            plt.close(fig)
+
+    print(f"Zero-shot predictions saved to: {save_dir}")
 # ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
@@ -659,17 +732,45 @@ def save_confusion_matrix(conf, out_path):
 
 def save_prediction_visuals(vis_samples, out_dir):
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
     for idx, sample in enumerate(vis_samples, start=1):
-        t1 = sample["t1"].permute(1, 2, 0).numpy()
-        t2 = sample["t2"].permute(1, 2, 0).numpy()
-        mask = sample["mask"].squeeze(0).numpy()
-        pred = sample["pred"].squeeze(0).numpy()
-        prob = sample["prob"].squeeze(0).numpy()
+        t1 = sample["t1"].detach().cpu()
+        t2 = sample["t2"].detach().cpu()
+        mask = sample["mask"].squeeze(0).detach().cpu().numpy()
+        pred = sample["pred"].squeeze(0).detach().cpu().numpy()
+        prob = sample["prob"].squeeze(0).detach().cpu().numpy()
+
+        if t1.shape[0] == 3:
+            t1 = t1.permute(1, 2, 0).numpy()
+            t2 = t2.permute(1, 2, 0).numpy()
+
+            # de-normalizacija iz ImageNet prostora nazad u [0, 1]
+            t1 = t1 * std + mean
+            t2 = t2 * std + mean
+
+            t1 = np.clip(t1, 0, 1)
+            t2 = np.clip(t2, 0, 1)
+        else:
+            t1 = t1.squeeze(0).numpy()
+            t2 = t2.squeeze(0).numpy()
+
+            # za non-RGB fallback
+            t1 = np.clip(t1, 0, 1)
+            t2 = np.clip(t2, 0, 1)
 
         fig, axes = plt.subplots(1, 5, figsize=(18, 4))
-        axes[0].imshow(np.clip(t1, 0, 1))
+
+        if t1.ndim == 3:
+            axes[0].imshow(t1)
+            axes[1].imshow(t2)
+        else:
+            axes[0].imshow(t1, cmap="gray")
+            axes[1].imshow(t2, cmap="gray")
+
         axes[0].set_title("T1")
-        axes[1].imshow(np.clip(t2, 0, 1))
         axes[1].set_title("T2")
         axes[2].imshow(mask, cmap="gray")
         axes[2].set_title("GT Mask")
@@ -677,12 +778,46 @@ def save_prediction_visuals(vis_samples, out_dir):
         axes[3].set_title("Pred Prob")
         axes[4].imshow(pred, cmap="gray")
         axes[4].set_title("Pred Mask")
+
         for ax in axes:
             ax.axis("off")
+
         plt.tight_layout()
         fig.savefig(out_dir / f"prediction_{idx}.png", dpi=150, bbox_inches="tight")
         plt.close(fig)
 
+# ---------------------------------------------------------------------------
+# Model factory
+# ---------------------------------------------------------------------------
+
+def build_model(args, device):
+    if args.model_name == "unet":
+        model = UNet(
+            in_channels=6,
+            out_channels=1,
+            features=(32, 64, 128, 256)
+        ).to(device)
+
+    elif args.model_name == "siamdiff":
+        model = SiamUnet_diff(
+            input_nbr=3,
+            label_nbr=1,
+            use_attention=args.use_attention,
+            use_hybrid=args.use_hybrid,
+        ).to(device)
+
+    elif args.model_name == "unet_resnet":
+        model = smp.Unet(
+            encoder_name="resnet34",
+            encoder_weights="imagenet",
+            in_channels=6,
+            classes=1,
+            activation=None
+        ).to(device)
+    else:
+        raise ValueError(f"Unknown model_name: {args.model_name}")
+
+    return model
 
 # ---------------------------------------------------------------------------
 # Main
@@ -694,18 +829,117 @@ def main(args):
     torch.backends.cudnn.benchmark = False
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    print(f"DEBUG mode = {args.mode}")
+    print(f"DEBUG local_val_dir = {args.local_val_dir}")
+    print(f"DEBUG checkpoint_path = {args.checkpoint_path}")
 
     out_dir = Path(args.output_dir)
     artifact_dir = out_dir / "artifacts"
     out_dir.mkdir(parents=True, exist_ok=True)
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
+    model = build_model(args, device)
+
+    if args.mode == "zeroshot":
+        print("DEBUG ENTERED ZEROSHOT BRANCH")
+        if args.checkpoint_path is None:
+            raise ValueError("--checkpoint-path je obavezan za zeroshot")
+        if args.local_val_dir is None:
+            raise ValueError("--local-val-dir je obavezan za zeroshot")
+
+        model = load_checkpoint(model, args.checkpoint_path, device)
+
+        eval_ds = LocalChangeDataset(
+            patches_dir=args.local_val_dir,
+            normalize="scale_10000",
+            apply_imagenet_norm=True,
+            augment="none",
+            patch_size=args.patch_size,
+            crop_mode="none",
+            split="val",
+            num_crops_per_image=1,
+        )
+
+        eval_loader = DataLoader(
+            eval_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+        )
+
+        criterion = DiceLoss()
+
+        metrics = evaluate(
+            model=model,
+            loader=eval_loader,
+            criterion=criterion,
+            device=device,
+            threshold=args.threshold,
+            max_vis=3,
+        )
+
+        print(
+            f"Zero-shot | "
+            f"loss={metrics['loss']:.4f} | "
+            f"iou={metrics['iou']:.4f} | "
+            f"dice={metrics['dice']:.4f} | "
+            f"precision={metrics['precision']:.4f} | "
+            f"recall={metrics['recall']:.4f}"
+        )
+
+        save_prediction_visuals(
+            metrics["vis_samples"],
+            Path(args.save_preds_dir)
+        )
+
+        save_confusion_matrix(
+            metrics["confusion"],
+            artifact_dir / "zeroshot_confusion_matrix.png"
+        )
+
+        return  # ← izlaz iz main(), ne ulazi u trening
+    print("DEBUG ENTERED TRAIN/FINETUNE BRANCH")
     mlflow.set_tracking_uri(args.mlflow_tracking_uri)
     mlflow.set_experiment(args.experiment_name)
 
-    train_ds = OSCDDataset(split="train", patch_size=args.patch_size, crop_mode="random_crop", augment=args.augment, num_crops_per_image=20)
-    val_ds   = OSCDDataset(split="test",  patch_size=args.patch_size, crop_mode="center_crop",   augment="none", num_crops_per_image=1)
+    if args.local_train_dir is not None and args.local_val_dir is not None:
+        train_ds = LocalChangeDataset(
+            patches_dir=args.local_train_dir,
+            normalize="scale_10000",
+            apply_imagenet_norm=True,
+            augment=args.augment,
+            patch_size=args.patch_size,
+            crop_mode="none",
+            split="train",
+            num_crops_per_image=1,
+        )
 
+        val_ds = LocalChangeDataset(
+            patches_dir=args.local_val_dir,
+            normalize="scale_10000",
+            apply_imagenet_norm=True,
+            augment="none",
+            patch_size=args.patch_size,
+            crop_mode="none",
+            split="val",
+            num_crops_per_image=1,
+        )
+    else:
+        train_ds = OSCDDataset(
+            split="train",
+            patch_size=args.patch_size,
+            crop_mode="random_crop",
+            augment=args.augment,
+            num_crops_per_image=20,
+        )
+
+        val_ds = OSCDDataset(
+            split="test",
+            patch_size=args.patch_size,
+            crop_mode="center_crop",
+            augment="none",
+            num_crops_per_image=1,
+        )
 
     g = torch.Generator()
     g.manual_seed(args.seed)
@@ -742,32 +976,6 @@ def main(args):
 
     print(f"Class balance: pos={pos_count}, neg={neg_count}, pos_weight={pos_weight:.2f}")
 
-    if args.model_name == "unet":
-        model = UNet(
-            in_channels=6,
-            out_channels=1,
-            features=(32, 64, 128, 256)
-        ).to(device)
-
-
-    elif args.model_name == "siamdiff":
-        model = SiamUnet_diff(
-            input_nbr=3,
-            label_nbr=1,
-            use_attention=args.use_attention,
-            use_hybrid=args.use_hybrid,
-        ).to(device)
-
-    elif args.model_name == "unet_resnet":
-        model = smp.Unet(
-        encoder_name="resnet34",
-        encoder_weights="imagenet",
-        in_channels=6,
-        classes=1,
-        activation=None
-    ).to(device)
-    else:
-        raise ValueError(f"Unknown model_name: {args.model_name}")
 
     pos_weight_tensor = torch.tensor(pos_weight, device=device)
 
@@ -978,6 +1186,26 @@ if __name__ == "__main__":
         choices=["none", "flip", "flip_rot90", "strong"],
         help="Augmentation mode: none | flip | flip_rot90 | strong (flip_rot90 + photometric)",
     )
+    parser.add_argument("--mode", type=str, default="train",
+                        choices=["train", "zeroshot", "finetune"])
+
+    parser.add_argument("--checkpoint-path", type=str, default=None,
+                        help="Putanja do pretrained/best checkpointa za zero-shot ili finetune.")
+
+    parser.add_argument("--local-data-dir", type=str, default=None,
+                        help="Root direktorijum lokalnog dataseta sa t1/t2/labels.")
+
+    parser.add_argument("--local-train-dir", type=str, default=None,
+                        help="Putanja do lokalnog TRAIN foldera")
+
+    parser.add_argument("--local-val-dir", type=str, default=None,
+                        help="Putanja do lokalnog VAL foldera")
+
+    parser.add_argument("--save-preds-dir", type=str, default="predictions_local",
+                        help="Gdje da sačuva zero-shot predikcije.")
+
+    parser.add_argument("--threshold", type=float, default=0.5,
+                        help="Threshold za binarnu masku.")
 
     # Training
     parser.add_argument("--batch-size", type=int, default=4)

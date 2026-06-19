@@ -5,17 +5,16 @@ gis/
 polygons/
 reports/
 data/
+output/
 
 
-*.tiff
-*.tif
 *.pbf
 *.zip
 *.npz
 *.npy
 *.aux.xml
 *.db
-
+*.pt
 .vscode/
 
 __pycache__/
