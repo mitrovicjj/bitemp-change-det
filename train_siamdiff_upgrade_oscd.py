@@ -367,7 +367,7 @@ class BCEDiceLoss(nn.Module):
     def __init__(self, bce_weight=0.5, pos_weight=None):
         super().__init__()
         if pos_weight is not None:
-            self.bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight, device=device))
+            self.bce = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight))
         else:
             self.bce = nn.BCEWithLogitsLoss()
         self.bce_weight = bce_weight
