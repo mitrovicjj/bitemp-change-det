@@ -898,7 +898,7 @@ def main(args):
                 torch.save(checkpoint, best_path)
                 print(f"  => Saved new best model (epoch {epoch})")
 
-            if early_stopping.step(val_metrics["dice"], epoch):
+            if early_stopping.step(-val_metrics["dice"], epoch):
                 print(
                     f"Early stopping at epoch {epoch:03d}. "
                     f"Best epoch: {early_stopping.best_epoch:03d}, "
