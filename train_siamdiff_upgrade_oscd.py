@@ -791,13 +791,7 @@ def save_prediction_visuals(vis_samples, out_dir):
 # ---------------------------------------------------------------------------
 
 def build_model(args, device):
-    if args.mode == "finetune":
-        if args.checkpoint_path is None:
-            raise ValueError("--checkpoint-path je obavezan za finetune")
 
-        model = load_checkpoint(model, args.checkpoint_path, device)
-        print("DEBUG FINETUNE: checkpoint loaded")
-    
     if args.model_name == "unet":
         model = UNet(
             in_channels=6,
@@ -846,8 +840,11 @@ def main(args):
     artifact_dir.mkdir(parents=True, exist_ok=True)
 
     model = build_model(args, device)
-
-    if args.mode == "zeroshot":
+    if args.mode == "finetune":
+        if args.checkpoint_path is None:
+            raise ValueError("--checkpoint-path je obavezan za finetune")
+        model = load_checkpoint(model, args.checkpoint_path, device)
+    elif args.mode == "zeroshot":
         print("DEBUG ENTERED ZEROSHOT BRANCH")
         if args.checkpoint_path is None:
             raise ValueError("--checkpoint-path je obavezan za zeroshot")
