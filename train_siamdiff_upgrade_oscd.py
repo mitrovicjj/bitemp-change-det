@@ -1132,11 +1132,13 @@ def main(args):
         model.load_state_dict(best_ckpt["model_state_dict"])
         model.eval()
 
-        results, best_thr = threshold_sweep(model, val_loader, criterion, device)
-        best_threshold = best_thr["threshold"]
+        best_threshold = 0.5
 
         final_eval = evaluate(
-            model, val_loader, criterion, device,
+            model,
+            val_loader,
+            criterion,
+            device,
             threshold=best_threshold,
             max_vis=3,
         )
@@ -1149,26 +1151,12 @@ def main(args):
         save_confusion_matrix(final_eval["confusion"], confusion_path)
         save_prediction_visuals(final_eval["vis_samples"], pred_dir)
 
-        if args.do_threshold_sweep:
-            sweep_results = threshold_sweep(
-                model, val_loader, criterion, device,
-                thresholds=args.thresholds,
-            )
-            sweep_path = artifact_dir / "threshold_sweep.csv"
-            with open(sweep_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=list(sweep_results[0].keys()))
-                writer.writeheader()
-                writer.writerows(sweep_results)
-            mlflow.log_artifact(str(sweep_path))
-            print(f"Threshold sweep saved to {sweep_path}")
-
         mlflow.log_artifact(str(best_path))
         mlflow.log_artifact(str(last_path))
         mlflow.log_artifact(str(curves_path))
         mlflow.log_artifact(str(confusion_path))
         mlflow.log_artifacts(str(pred_dir), artifact_path="predictions")
-        #mlflow.pytorch.log_model(model, artifact_path="model")
-
+        # mlflow.pytorch.log_model(model, artifact_path="model")
 
 # ---------------------------------------------------------------------------
 # CLI
