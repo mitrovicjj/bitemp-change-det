@@ -12,7 +12,8 @@ import mlflow
 import mlflow.pytorch
 from torch.nn.modules.padding import ReplicationPad2d
 from torch.utils.data import DataLoader
-
+import segmentation_models_pytorch as smp
+from src.local import LocalChangeDataset
 from src.oscd import OSCDDataset
 
 
@@ -24,8 +25,21 @@ def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
+def load_checkpoint(model, checkpoint_path, device):
+    ckpt = torch.load(checkpoint_path, map_location=device)
 
+    if "model_state_dict" in ckpt:
+        state_dict = ckpt["model_state_dict"]
+    else:
+        state_dict = ckpt
+
+    model.load_state_dict(state_dict, strict=True)
+    print(f"Loaded checkpoint: {checkpoint_path}")
+    return model
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
@@ -88,182 +102,284 @@ class UNet(nn.Module):
 
         return self.final_conv(x)
 
+class DiceLoss(nn.Module):
+    def __init__(self, smooth=1e-6):
+        super().__init__()
+        self.smooth = smooth
 
+    def forward(self, logits, targets):
+        probs = torch.sigmoid(logits)
+        probs = probs.contiguous()
+        targets = targets.contiguous()
+
+        intersection = (probs * targets).sum(dim=(1, 2, 3))
+        union = probs.sum(dim=(1, 2, 3)) + targets.sum(dim=(1, 2, 3))
+        dice = (2.0 * intersection + self.smooth) / (union + self.smooth)
+        return 1.0 - dice.mean()
+
+
+class AttentionGate(nn.Module):
+    def __init__(self, gate_ch, skip_ch, inter_ch):
+        super().__init__()
+        self.W_g = nn.Sequential(
+            nn.Conv2d(gate_ch, inter_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(inter_ch),
+        )
+        self.W_x = nn.Sequential(
+            nn.Conv2d(skip_ch, inter_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(inter_ch),
+        )
+        self.psi = nn.Sequential(
+            nn.Conv2d(inter_ch, 1, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, g, x):
+        if g.shape[-2:] != x.shape[-2:]:
+            g = F.interpolate(g, size=x.shape[-2:], mode="bilinear", align_corners=False)
+        attn = self.relu(self.W_g(g) + self.W_x(x))
+        attn = self.psi(attn)
+        return x * attn
+
+
+class HybridDiffConcatFusion(nn.Module):
+    """Hybrid skip fusion using difference and concatenation."""
+    def __init__(self, ch):
+        super().__init__()
+        self.fuse = nn.Sequential(
+            nn.Conv2d(ch * 3, ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, f1, f2):
+        diff = torch.abs(f1 - f2)
+        conc = torch.cat([f1, f2], dim=1)
+        x = torch.cat([diff, conc], dim=1)
+        return self.fuse(x)
+    
 class SiamUnet_diff(nn.Module):
     """SiamUnet_diff segmentation network adapted for binary change detection."""
 
-    def __init__(self, input_nbr, label_nbr=1):
+    def __init__(self, input_nbr, label_nbr=1, use_attention=True, use_hybrid=True):
         super(SiamUnet_diff, self).__init__()
 
         self.input_nbr = input_nbr
+        self.use_attention = use_attention
+        self.use_hybrid = use_hybrid
 
-        self.conv11 = nn.Conv2d(input_nbr, 16, kernel_size=3, padding=1)
-        self.bn11 = nn.BatchNorm2d(16)
+        # ---------------- Encoder ----------------
+        self.conv11 = nn.Conv2d(input_nbr, 32, kernel_size=3, padding=1)
+        self.bn11 = nn.BatchNorm2d(32)
         self.do11 = nn.Dropout2d(p=0.2)
-        self.conv12 = nn.Conv2d(16, 16, kernel_size=3, padding=1)
-        self.bn12 = nn.BatchNorm2d(16)
+
+        self.conv12 = nn.Conv2d(32, 32, kernel_size=3, padding=1)
+        self.bn12 = nn.BatchNorm2d(32)
         self.do12 = nn.Dropout2d(p=0.2)
 
-        self.conv21 = nn.Conv2d(16, 32, kernel_size=3, padding=1)
-        self.bn21 = nn.BatchNorm2d(32)
+        self.conv21 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.bn21 = nn.BatchNorm2d(64)
         self.do21 = nn.Dropout2d(p=0.2)
-        self.conv22 = nn.Conv2d(32, 32, kernel_size=3, padding=1)
-        self.bn22 = nn.BatchNorm2d(32)
+
+        self.conv22 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
+        self.bn22 = nn.BatchNorm2d(64)
         self.do22 = nn.Dropout2d(p=0.2)
 
-        self.conv31 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
-        self.bn31 = nn.BatchNorm2d(64)
+        self.conv31 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
+        self.bn31 = nn.BatchNorm2d(128)
         self.do31 = nn.Dropout2d(p=0.2)
-        self.conv32 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
-        self.bn32 = nn.BatchNorm2d(64)
+
+        self.conv32 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
+        self.bn32 = nn.BatchNorm2d(128)
         self.do32 = nn.Dropout2d(p=0.2)
-        self.conv33 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
-        self.bn33 = nn.BatchNorm2d(64)
+
+        self.conv33 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
+        self.bn33 = nn.BatchNorm2d(128)
         self.do33 = nn.Dropout2d(p=0.2)
 
-        self.conv41 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
-        self.bn41 = nn.BatchNorm2d(128)
+        self.conv41 = nn.Conv2d(128, 256, kernel_size=3, padding=1)
+        self.bn41 = nn.BatchNorm2d(256)
         self.do41 = nn.Dropout2d(p=0.2)
-        self.conv42 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
-        self.bn42 = nn.BatchNorm2d(128)
+
+        self.conv42 = nn.Conv2d(256, 256, kernel_size=3, padding=1)
+        self.bn42 = nn.BatchNorm2d(256)
         self.do42 = nn.Dropout2d(p=0.2)
-        self.conv43 = nn.Conv2d(128, 128, kernel_size=3, padding=1)
-        self.bn43 = nn.BatchNorm2d(128)
+
+        self.conv43 = nn.Conv2d(256, 256, kernel_size=3, padding=1)
+        self.bn43 = nn.BatchNorm2d(256)
         self.do43 = nn.Dropout2d(p=0.2)
 
+        # ---------------- Decoder ----------------
         self.upconv4 = nn.ConvTranspose2d(
-            128, 128, kernel_size=3, padding=1, stride=2, output_padding=1
+            256, 256, kernel_size=3, padding=1, stride=2, output_padding=1
         )
 
-        self.conv43d = nn.ConvTranspose2d(256, 128, kernel_size=3, padding=1)
-        self.bn43d = nn.BatchNorm2d(128)
+        self.conv43d = nn.ConvTranspose2d(512, 256, kernel_size=3, padding=1)
+        self.bn43d = nn.BatchNorm2d(256)
         self.do43d = nn.Dropout2d(p=0.2)
-        self.conv42d = nn.ConvTranspose2d(128, 128, kernel_size=3, padding=1)
-        self.bn42d = nn.BatchNorm2d(128)
+
+        self.conv42d = nn.ConvTranspose2d(256, 256, kernel_size=3, padding=1)
+        self.bn42d = nn.BatchNorm2d(256)
         self.do42d = nn.Dropout2d(p=0.2)
-        self.conv41d = nn.ConvTranspose2d(128, 64, kernel_size=3, padding=1)
-        self.bn41d = nn.BatchNorm2d(64)
+
+        self.conv41d = nn.ConvTranspose2d(256, 128, kernel_size=3, padding=1)
+        self.bn41d = nn.BatchNorm2d(128)
         self.do41d = nn.Dropout2d(p=0.2)
 
         self.upconv3 = nn.ConvTranspose2d(
-            64, 64, kernel_size=3, padding=1, stride=2, output_padding=1
+            128, 128, kernel_size=3, padding=1, stride=2, output_padding=1
         )
 
-        self.conv33d = nn.ConvTranspose2d(128, 64, kernel_size=3, padding=1)
-        self.bn33d = nn.BatchNorm2d(64)
+        self.conv33d = nn.ConvTranspose2d(256, 128, kernel_size=3, padding=1)
+        self.bn33d = nn.BatchNorm2d(128)
         self.do33d = nn.Dropout2d(p=0.2)
-        self.conv32d = nn.ConvTranspose2d(64, 64, kernel_size=3, padding=1)
-        self.bn32d = nn.BatchNorm2d(64)
+
+        self.conv32d = nn.ConvTranspose2d(128, 128, kernel_size=3, padding=1)
+        self.bn32d = nn.BatchNorm2d(128)
         self.do32d = nn.Dropout2d(p=0.2)
-        self.conv31d = nn.ConvTranspose2d(64, 32, kernel_size=3, padding=1)
-        self.bn31d = nn.BatchNorm2d(32)
+
+        self.conv31d = nn.ConvTranspose2d(128, 64, kernel_size=3, padding=1)
+        self.bn31d = nn.BatchNorm2d(64)
         self.do31d = nn.Dropout2d(p=0.2)
 
         self.upconv2 = nn.ConvTranspose2d(
-            32, 32, kernel_size=3, padding=1, stride=2, output_padding=1
+            64, 64, kernel_size=3, padding=1, stride=2, output_padding=1
         )
 
-        self.conv22d = nn.ConvTranspose2d(64, 32, kernel_size=3, padding=1)
-        self.bn22d = nn.BatchNorm2d(32)
+        self.conv22d = nn.ConvTranspose2d(128, 64, kernel_size=3, padding=1)
+        self.bn22d = nn.BatchNorm2d(64)
         self.do22d = nn.Dropout2d(p=0.2)
-        self.conv21d = nn.ConvTranspose2d(32, 16, kernel_size=3, padding=1)
-        self.bn21d = nn.BatchNorm2d(16)
+
+        self.conv21d = nn.ConvTranspose2d(64, 32, kernel_size=3, padding=1)
+        self.bn21d = nn.BatchNorm2d(32)
         self.do21d = nn.Dropout2d(p=0.2)
 
         self.upconv1 = nn.ConvTranspose2d(
-            16, 16, kernel_size=3, padding=1, stride=2, output_padding=1
+            32, 32, kernel_size=3, padding=1, stride=2, output_padding=1
         )
 
-        self.conv12d = nn.ConvTranspose2d(32, 16, kernel_size=3, padding=1)
-        self.bn12d = nn.BatchNorm2d(16)
+        self.conv12d = nn.ConvTranspose2d(64, 32, kernel_size=3, padding=1)
+        self.bn12d = nn.BatchNorm2d(32)
         self.do12d = nn.Dropout2d(p=0.2)
-        self.conv11d = nn.ConvTranspose2d(16, label_nbr, kernel_size=3, padding=1)
+
+        self.conv11d = nn.ConvTranspose2d(32, label_nbr, kernel_size=3, padding=1)
+
+        if self.use_attention:
+            self.att4 = AttentionGate(gate_ch=256, skip_ch=256, inter_ch=128)
+            self.att3 = AttentionGate(gate_ch=128, skip_ch=128, inter_ch=64)
+            self.att2 = AttentionGate(gate_ch=64, skip_ch=64, inter_ch=32)
+            self.att1 = AttentionGate(gate_ch=32, skip_ch=32, inter_ch=16)
+
+        if self.use_hybrid:
+            self.fuse4 = HybridDiffConcatFusion(256)
+            self.fuse3 = HybridDiffConcatFusion(128)
+            self.fuse2 = HybridDiffConcatFusion(64)
+            self.fuse1 = HybridDiffConcatFusion(32)
+
+
+    def encode(self, x):
+        x1 = self.do11(F.relu(self.bn11(self.conv11(x))))
+        x2 = self.do12(F.relu(self.bn12(self.conv12(x1))))
+        p1 = F.max_pool2d(x2, 2, 2)
+
+        x3 = self.do21(F.relu(self.bn21(self.conv21(p1))))
+        x4 = self.do22(F.relu(self.bn22(self.conv22(x3))))
+        p2 = F.max_pool2d(x4, 2, 2)
+
+        x5 = self.do31(F.relu(self.bn31(self.conv31(p2))))
+        x6 = self.do32(F.relu(self.bn32(self.conv32(x5))))
+        x7 = self.do33(F.relu(self.bn33(self.conv33(x6))))
+        p3 = F.max_pool2d(x7, 2, 2)
+
+        x8 = self.do41(F.relu(self.bn41(self.conv41(p3))))
+        x9 = self.do42(F.relu(self.bn42(self.conv42(x8))))
+        x10 = self.do43(F.relu(self.bn43(self.conv43(x9))))
+        p4 = F.max_pool2d(x10, 2, 2)
+
+        return x2, x4, x7, x10, p4
+
 
     def forward(self, x1, x2):
-        # Encoder branch for t1
-        x11 = self.do11(F.relu(self.bn11(self.conv11(x1))))
-        x12_1 = self.do12(F.relu(self.bn12(self.conv12(x11))))
-        x1p = F.max_pool2d(x12_1, kernel_size=2, stride=2)
+        # shared encoder (Siamese weight sharing)
+        f1_1, f1_2, f1_3, f1_4, f1_p = self.encode(x1)
+        f2_1, f2_2, f2_3, f2_4, f2_p = self.encode(x2)
 
-        x21 = self.do21(F.relu(self.bn21(self.conv21(x1p))))
-        x22_1 = self.do22(F.relu(self.bn22(self.conv22(x21))))
-        x2p = F.max_pool2d(x22_1, kernel_size=2, stride=2)
+        # ---------------- Decoder ----------------
+        x = self.upconv4(f1_p - f2_p)
 
-        x31 = self.do31(F.relu(self.bn31(self.conv31(x2p))))
-        x32 = self.do32(F.relu(self.bn32(self.conv32(x31))))
-        x33_1 = self.do33(F.relu(self.bn33(self.conv33(x32))))
-        x3p = F.max_pool2d(x33_1, kernel_size=2, stride=2)
+        if self.use_hybrid:
+            skip4 = self.fuse4(f1_4, f2_4)
+        else:
+            skip4 = torch.abs(f1_4 - f2_4)
 
-        x41 = self.do41(F.relu(self.bn41(self.conv41(x3p))))
-        x42 = self.do42(F.relu(self.bn42(self.conv42(x41))))
-        x43_1 = self.do43(F.relu(self.bn43(self.conv43(x42))))
-        x4p = F.max_pool2d(x43_1, kernel_size=2, stride=2)
+        if self.use_attention:
+            skip4 = self.att4(x, skip4)
 
-        # Encoder branch for t2
-        x11 = self.do11(F.relu(self.bn11(self.conv11(x2))))
-        x12_2 = self.do12(F.relu(self.bn12(self.conv12(x11))))
-        x1p = F.max_pool2d(x12_2, kernel_size=2, stride=2)
+        x = torch.cat([x, skip4], dim=1)
+        x = self.do43d(F.relu(self.bn43d(self.conv43d(x))))
+        x = self.do42d(F.relu(self.bn42d(self.conv42d(x))))
+        x = self.do41d(F.relu(self.bn41d(self.conv41d(x))))
 
-        x21 = self.do21(F.relu(self.bn21(self.conv21(x1p))))
-        x22_2 = self.do22(F.relu(self.bn22(self.conv22(x21))))
-        x2p = F.max_pool2d(x22_2, kernel_size=2, stride=2)
+        # level 3
+        x = self.upconv3(x)
 
-        x31 = self.do31(F.relu(self.bn31(self.conv31(x2p))))
-        x32 = self.do32(F.relu(self.bn32(self.conv32(x31))))
-        x33_2 = self.do33(F.relu(self.bn33(self.conv33(x32))))
-        x3p = F.max_pool2d(x33_2, kernel_size=2, stride=2)
+        if self.use_hybrid:
+            skip3 = self.fuse3(f1_3, f2_3)
+        else:
+            skip3 = torch.abs(f1_3 - f2_3)
 
-        x41 = self.do41(F.relu(self.bn41(self.conv41(x3p))))
-        x42 = self.do42(F.relu(self.bn42(self.conv42(x41))))
-        x43_2 = self.do43(F.relu(self.bn43(self.conv43(x42))))
-        x4p = F.max_pool2d(x43_2, kernel_size=2, stride=2)
+        if self.use_attention:
+            skip3 = self.att3(x, skip3)
 
-        # Decoder
-        x4d = self.upconv4(x4p)
-        pad4 = ReplicationPad2d(
-            (0, x43_1.size(3) - x4d.size(3), 0, x43_1.size(2) - x4d.size(2))
-        )
-        x4d = torch.cat((pad4(x4d), torch.abs(x43_1 - x43_2)), 1)
-        x43d = self.do43d(F.relu(self.bn43d(self.conv43d(x4d))))
-        x42d = self.do42d(F.relu(self.bn42d(self.conv42d(x43d))))
-        x41d = self.do41d(F.relu(self.bn41d(self.conv41d(x42d))))
+        x = torch.cat([x, skip3], dim=1)
+        x = self.do33d(F.relu(self.bn33d(self.conv33d(x))))
+        x = self.do32d(F.relu(self.bn32d(self.conv32d(x))))
+        x = self.do31d(F.relu(self.bn31d(self.conv31d(x))))
 
-        x3d = self.upconv3(x41d)
-        pad3 = ReplicationPad2d(
-            (0, x33_1.size(3) - x3d.size(3), 0, x33_1.size(2) - x3d.size(2))
-        )
-        x3d = torch.cat((pad3(x3d), torch.abs(x33_1 - x33_2)), 1)
-        x33d = self.do33d(F.relu(self.bn33d(self.conv33d(x3d))))
-        x32d = self.do32d(F.relu(self.bn32d(self.conv32d(x33d))))
-        x31d = self.do31d(F.relu(self.bn31d(self.conv31d(x32d))))
+        # level 2
+        x = self.upconv2(x)
 
-        x2d = self.upconv2(x31d)
-        pad2 = ReplicationPad2d(
-            (0, x22_1.size(3) - x2d.size(3), 0, x22_1.size(2) - x2d.size(2))
-        )
-        x2d = torch.cat((pad2(x2d), torch.abs(x22_1 - x22_2)), 1)
-        x22d = self.do22d(F.relu(self.bn22d(self.conv22d(x2d))))
-        x21d = self.do21d(F.relu(self.bn21d(self.conv21d(x22d))))
+        if self.use_hybrid:
+            skip2 = self.fuse2(f1_2, f2_2)
+        else:
+            skip2 = torch.abs(f1_2 - f2_2)
 
-        x1d = self.upconv1(x21d)
-        pad1 = ReplicationPad2d(
-            (0, x12_1.size(3) - x1d.size(3), 0, x12_1.size(2) - x1d.size(2))
-        )
-        x1d = torch.cat((pad1(x1d), torch.abs(x12_1 - x12_2)), 1)
-        x12d = self.do12d(F.relu(self.bn12d(self.conv12d(x1d))))
-        x11d = self.conv11d(x12d)
+        if self.use_attention:
+            skip2 = self.att2(x, skip2)
 
-        return x11d
+        x = torch.cat([x, skip2], dim=1)
+        x = self.do22d(F.relu(self.bn22d(self.conv22d(x))))
+        x = self.do21d(F.relu(self.bn21d(self.conv21d(x))))
 
+        # level 1
+        x = self.upconv1(x)
+
+        if self.use_hybrid:
+            skip1 = self.fuse1(f1_1, f2_1)
+        else:
+            skip1 = torch.abs(f1_1 - f2_1)
+
+        if self.use_attention:
+            skip1 = self.att1(x, skip1)
+
+        x = torch.cat([x, skip1], dim=1)
+        x = self.do12d(F.relu(self.bn12d(self.conv12d(x))))
+        x = self.conv11d(x)
+
+        return x
 
 # ---------------------------------------------------------------------------
 # Loss functions
 # ---------------------------------------------------------------------------
 
 class BCEDiceLoss(nn.Module):
-    def __init__(self, bce_weight=0.5):
+    def __init__(self, bce_weight=0.5, pos_weight=None):
         super().__init__()
-        self.bce = nn.BCEWithLogitsLoss()
+        if pos_weight is not None:
+            self.bce = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        else:
+            self.bce = nn.BCEWithLogitsLoss()
         self.bce_weight = bce_weight
 
     def forward(self, logits, targets):
@@ -274,10 +390,10 @@ class BCEDiceLoss(nn.Module):
         union = probs.sum(dim=(1, 2, 3)) + targets.sum(dim=(1, 2, 3))
         dice_loss = 1.0 - ((2.0 * intersection + smooth) / (union + smooth)).mean()
         return self.bce_weight * bce + (1.0 - self.bce_weight) * dice_loss
-
+    
 
 class FocalLoss(nn.Module):
-    """Binary focal loss computed directly from logits."""
+    """Binary focal loss computed directly from logits (numerically stable)."""
 
     def __init__(self, alpha=0.25, gamma=2.0, reduction="mean"):
         super().__init__()
@@ -320,7 +436,68 @@ class FocalDiceLoss(nn.Module):
         dice_loss = 1.0 - ((2.0 * intersection + smooth) / (union + smooth)).mean()
         return self.focal_weight * focal_loss + (1.0 - self.focal_weight) * dice_loss
 
+# ---------------------------------------------------------------------------
+# Zero-shot
+# ---------------------------------------------------------------------------
+@torch.no_grad()
+def run_zeroshot_and_save(model, loader, device, save_dir, threshold=0.5):
+    model.eval()
+    save_dir = Path(save_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
 
+    sample_idx = 0
+
+    for t1, t2, mask in loader:
+        t1 = t1.to(device)
+        t2 = t2.to(device)
+
+        if getattr(model, "input_nbr", None) is not None:
+            logits = model(t1, t2)
+        else:
+            x = torch.cat([t1, t2], dim=1)
+            logits = model(x)
+
+        probs = torch.sigmoid(logits)
+        preds = (probs > threshold).float()
+
+        for i in range(t1.size(0)):
+            sample_idx += 1
+
+            prob_np = probs[i].squeeze().cpu().numpy()
+            pred_np = preds[i].squeeze().cpu().numpy()
+
+            np.save(save_dir / f"sample_{sample_idx:04d}_prob.npy", prob_np)
+            np.save(save_dir / f"sample_{sample_idx:04d}_pred.npy", pred_np)
+
+            fig, axes = plt.subplots(1, 4, figsize=(14, 4))
+
+            t1_img = t1[i].detach().cpu()
+            t2_img = t2[i].detach().cpu()
+
+            if t1_img.shape[0] == 3:
+                t1_img = t1_img.permute(1, 2, 0).numpy()
+                t2_img = t2_img.permute(1, 2, 0).numpy()
+                axes[0].imshow(np.clip(t1_img, 0, 1))
+                axes[1].imshow(np.clip(t2_img, 0, 1))
+            else:
+                axes[0].imshow(t1_img[0].numpy(), cmap="gray")
+                axes[1].imshow(t2_img[0].numpy(), cmap="gray")
+
+            axes[0].set_title("T1")
+            axes[1].set_title("T2")
+            axes[2].imshow(prob_np, cmap="viridis")
+            axes[2].set_title("Prob")
+            axes[3].imshow(pred_np, cmap="gray")
+            axes[3].set_title("Pred")
+
+            for ax in axes:
+                ax.axis("off")
+
+            plt.tight_layout()
+            fig.savefig(save_dir / f"sample_{sample_idx:04d}.png", dpi=150, bbox_inches="tight")
+            plt.close(fig)
+
+    print(f"Zero-shot predictions saved to: {save_dir}")
 # ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
@@ -329,7 +506,7 @@ class FocalDiceLoss(nn.Module):
 def evaluate(model, loader, criterion, device, threshold=0.5, max_vis=3):
     model.eval()
     total_loss = total_iou = total_dice = 0.0
-    total_precision = total_recall = total_f1 = total_pixel_acc = 0.0
+    total_precision = total_recall = total_pixel_acc = 0.0
     batches = 0
 
     all_preds = []
@@ -341,7 +518,7 @@ def evaluate(model, loader, criterion, device, threshold=0.5, max_vis=3):
         t2 = t2.to(device)
         mask = mask.to(device)
 
-        if hasattr(model, "input_nbr"):
+        if getattr(model, "input_nbr", None) is not None:
             logits = model(t1, t2)
         else:
             x = torch.cat([t1, t2], dim=1)
@@ -360,7 +537,6 @@ def evaluate(model, loader, criterion, device, threshold=0.5, max_vis=3):
         dice = ((2 * tp + 1e-6) / (2 * tp + fp + fn + 1e-6)).mean().item()
         precision = ((tp + 1e-6) / (tp + fp + 1e-6)).mean().item()
         recall = ((tp + 1e-6) / (tp + fn + 1e-6)).mean().item()
-        f1 = ((2 * tp + 1e-6) / (2 * tp + fp + fn + 1e-6)).mean().item()
         pixel_acc = ((tp + tn + 1e-6) / (tp + tn + fp + fn + 1e-6)).mean().item()
 
         total_loss += loss.item()
@@ -368,7 +544,6 @@ def evaluate(model, loader, criterion, device, threshold=0.5, max_vis=3):
         total_dice += dice
         total_precision += precision
         total_recall += recall
-        total_f1 += f1
         total_pixel_acc += pixel_acc
         batches += 1
 
@@ -395,6 +570,9 @@ def evaluate(model, loader, criterion, device, threshold=0.5, max_vis=3):
     fn_g = int(((y_pred == 0) & (y_true == 1)).sum())
     tn_g = int(((y_pred == 0) & (y_true == 0)).sum())
 
+    dice_global = (2 * tp_g + 1e-6) / (2 * tp_g + fp_g + fn_g + 1e-6)
+    iou_global = (tp_g + 1e-6) / (tp_g + fp_g + fn_g + 1e-6)
+
     n = max(batches, 1)
     return {
         "loss": total_loss / n,
@@ -402,34 +580,45 @@ def evaluate(model, loader, criterion, device, threshold=0.5, max_vis=3):
         "dice": total_dice / n,
         "precision": total_precision / n,
         "recall": total_recall / n,
-        "f1": total_f1 / n,
         "pixel_accuracy": total_pixel_acc / n,
         "confusion": {"tp": tp_g, "fp": fp_g, "fn": fn_g, "tn": tn_g},
         "vis_samples": vis_samples,
+        "dice_global": dice_global,
+        "iou_global": iou_global
     }
 
 
 # ---------------------------------------------------------------------------
-# Sweep helper
+# Threshold sweep helper
 # ---------------------------------------------------------------------------
+def threshold_sweep(model, loader, criterion, device, thresholds=None):
+    if thresholds is None:
+        thresholds = np.arange(0.05, 0.95, 0.05)
 
-def threshold_sweep(model, loader, criterion, device, thresholds):
     results = []
+
     for thr in thresholds:
-        metrics = evaluate(model, loader, criterion, device, threshold=thr, max_vis=0)
-        results.append(
-            {
-                "threshold": thr,
-                "loss": metrics["loss"],
-                "f1": metrics["f1"],
-                "iou": metrics["iou"],
-                "dice": metrics["dice"],
-                "precision": metrics["precision"],
-                "recall": metrics["recall"],
-                "pixel_accuracy": metrics["pixel_accuracy"],
-            }
+        metrics = evaluate(
+            model,
+            loader,
+            criterion,
+            device,
+            threshold=thr,
+            max_vis=0
         )
-    return results
+
+        results.append({
+            "threshold": thr,
+            "dice": metrics["dice"],
+            "iou": metrics["iou"],
+            "precision": metrics["precision"],
+            "recall": metrics["recall"],
+            "pixel_accuracy": metrics["pixel_accuracy"],
+        })
+
+    best = max(results, key=lambda x: (x["dice"] + x["iou"]) / 2)
+
+    return results, best
 
 
 # ---------------------------------------------------------------------------
@@ -470,7 +659,8 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
         t2 = t2.to(device)
         mask = mask.to(device)
 
-        if hasattr(model, "input_nbr"):
+
+        if isinstance(model, SiamUnet_diff):
             logits = model(t1, t2)
         else:
             x = torch.cat([t1, t2], dim=1)
@@ -535,17 +725,45 @@ def save_confusion_matrix(conf, out_path):
 
 def save_prediction_visuals(vis_samples, out_dir):
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
     for idx, sample in enumerate(vis_samples, start=1):
-        t1 = sample["t1"].permute(1, 2, 0).numpy()
-        t2 = sample["t2"].permute(1, 2, 0).numpy()
-        mask = sample["mask"].squeeze(0).numpy()
-        pred = sample["pred"].squeeze(0).numpy()
-        prob = sample["prob"].squeeze(0).numpy()
+        t1 = sample["t1"].detach().cpu()
+        t2 = sample["t2"].detach().cpu()
+        mask = sample["mask"].squeeze(0).detach().cpu().numpy()
+        pred = sample["pred"].squeeze(0).detach().cpu().numpy()
+        prob = sample["prob"].squeeze(0).detach().cpu().numpy()
+
+        if t1.shape[0] == 3:
+            t1 = t1.permute(1, 2, 0).numpy()
+            t2 = t2.permute(1, 2, 0).numpy()
+
+            # undo ImageNet normalization
+            t1 = t1 * std + mean
+            t2 = t2 * std + mean
+
+            t1 = np.clip(t1, 0, 1)
+            t2 = np.clip(t2, 0, 1)
+        else:
+            t1 = t1.squeeze(0).numpy()
+            t2 = t2.squeeze(0).numpy()
+
+            # non-RGB fallback
+            t1 = np.clip(t1, 0, 1)
+            t2 = np.clip(t2, 0, 1)
 
         fig, axes = plt.subplots(1, 5, figsize=(18, 4))
-        axes[0].imshow(np.clip(t1, 0, 1))
+
+        if t1.ndim == 3:
+            axes[0].imshow(t1)
+            axes[1].imshow(t2)
+        else:
+            axes[0].imshow(t1, cmap="gray")
+            axes[1].imshow(t2, cmap="gray")
+
         axes[0].set_title("T1")
-        axes[1].imshow(np.clip(t2, 0, 1))
         axes[1].set_title("T2")
         axes[2].imshow(mask, cmap="gray")
         axes[2].set_title("GT Mask")
@@ -553,49 +771,19 @@ def save_prediction_visuals(vis_samples, out_dir):
         axes[3].set_title("Pred Prob")
         axes[4].imshow(pred, cmap="gray")
         axes[4].set_title("Pred Mask")
+
         for ax in axes:
             ax.axis("off")
+
         plt.tight_layout()
         fig.savefig(out_dir / f"prediction_{idx}.png", dpi=150, bbox_inches="tight")
         plt.close(fig)
 
-
 # ---------------------------------------------------------------------------
-# Main
+# Model choice
 # ---------------------------------------------------------------------------
 
-def main(args):
-    set_seed(args.seed)
-    device = torch.device("cpu")
-    print(f"Using device: {device}")
-
-    out_dir = Path(args.output_dir)
-    artifact_dir = out_dir / "artifacts"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-
-    mlflow.set_tracking_uri(args.mlflow_tracking_uri)
-    mlflow.set_experiment(args.experiment_name)
-
-    train_ds = OSCDDataset(
-        split="train",
-        patch_size=args.patch_size,
-        crop_mode=args.train_mode,
-        augment=args.augment,
-    )
-    val_ds = OSCDDataset(
-        split="test",
-        patch_size=args.patch_size,
-        crop_mode=args.val_mode,
-        augment="none",
-    )
-
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers
-    )
+def build_model(args, device):
 
     if args.model_name == "unet":
         model = UNet(
@@ -607,14 +795,193 @@ def main(args):
     elif args.model_name == "siamdiff":
         model = SiamUnet_diff(
             input_nbr=3,
-            label_nbr=1
+            label_nbr=1,
+            use_attention=args.use_attention,
+            use_hybrid=args.use_hybrid,
         ).to(device)
 
+    elif args.model_name == "unet_resnet":
+        model = smp.Unet(
+            encoder_name="resnet34",
+            encoder_weights="imagenet",
+            in_channels=6,
+            classes=1,
+            activation=None
+        ).to(device)
     else:
-        raise ValueError(f"Unsupported model_name='{args.model_name}'")
+        raise ValueError(f"Unknown model_name: {args.model_name}")
 
-    if args.loss_name == "bce_dice":
-        criterion = BCEDiceLoss(bce_weight=args.bce_weight)
+    return model
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main(args):
+    set_seed(args.seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    print(f"DEBUG mode = {args.mode}")
+    print(f"DEBUG local_val_dir = {args.local_val_dir}")
+    print(f"DEBUG checkpoint_path = {args.checkpoint_path}")
+
+    out_dir = Path(args.output_dir)
+    artifact_dir = out_dir / "artifacts"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+
+    model = build_model(args, device)
+    if args.mode == "finetune":
+        if args.checkpoint_path is None:
+            raise ValueError("--checkpoint-path missing")
+        model = load_checkpoint(model, args.checkpoint_path, device)
+    elif args.mode == "zeroshot":
+        print("DEBUG ENTERED ZEROSHOT BRANCH")
+        if args.checkpoint_path is None:
+            raise ValueError("--checkpoint-path missing")
+        if args.local_val_dir is None:
+            raise ValueError("--local-val-dir missing")
+
+        model = load_checkpoint(model, args.checkpoint_path, device)
+
+        eval_ds = LocalChangeDataset(
+            patches_dir=args.local_val_dir,
+            normalize="scale_10000",
+            apply_imagenet_norm=True,
+            augment="none",
+            split="val",
+        )
+
+        eval_loader = DataLoader(
+            eval_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+        )
+
+        criterion = DiceLoss()
+
+        metrics = evaluate(
+            model=model,
+            loader=eval_loader,
+            criterion=criterion,
+            device=device,
+            threshold=args.threshold,
+            max_vis=3,
+        )
+
+        print(
+            f"Zero-shot | "
+            f"loss={metrics['loss']:.4f} | "
+            f"iou={metrics['iou']:.4f} | "
+            f"dice={metrics['dice']:.4f} | "
+            f"precision={metrics['precision']:.4f} | "
+            f"recall={metrics['recall']:.4f}"
+        )
+
+        save_prediction_visuals(
+            metrics["vis_samples"],
+            Path(args.save_preds_dir)
+        )
+
+        save_confusion_matrix(
+            metrics["confusion"],
+            artifact_dir / "zeroshot_confusion_matrix.png"
+        )
+
+        return
+    
+    print("DEBUG ENTERED TRAIN/FINETUNE BRANCH")
+    mlflow.set_tracking_uri(args.mlflow_tracking_uri)
+    mlflow.set_experiment(args.experiment_name)
+
+    if args.local_train_dir is not None and args.local_val_dir is not None:
+        train_ds = LocalChangeDataset(
+            patches_dir=args.local_train_dir,
+            normalize="scale_10000",
+            apply_imagenet_norm=True,
+            augment=args.augment,
+            patch_size=args.patch_size,
+            crop_mode="none",
+            split="train",
+            num_crops_per_image=1,
+        )
+
+        val_ds = LocalChangeDataset(
+            patches_dir=args.local_val_dir,
+            normalize="scale_10000",
+            apply_imagenet_norm=True,
+            augment="none",
+            patch_size=args.patch_size,
+            crop_mode="none",
+            split="val",
+            num_crops_per_image=1,
+        )
+    else:
+        train_ds = OSCDDataset(
+            split="train",
+            patch_size=args.patch_size,
+            crop_mode="random_crop",
+            augment=args.augment,
+            num_crops_per_image=20,
+        )
+
+        val_ds = OSCDDataset(
+            split="test",
+            patch_size=args.patch_size,
+            crop_mode="center_crop",
+            augment="none",
+            num_crops_per_image=1,
+        )
+
+    g = torch.Generator()
+    g.manual_seed(args.seed)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        generator=g,
+        drop_last=True
+    )
+
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+    )
+
+    pos_count = 0
+    total_count = 0
+
+    for i in range(len(train_ds)):
+        _, _, mask = train_ds[i]
+        pos_count += mask.sum().item()
+        total_count += mask.numel()
+
+    neg_count = total_count - pos_count
+
+    eps = 1e-6
+    pos_weight = np.sqrt((neg_count + eps) / (pos_count + eps))
+    pos_weight = float(np.clip(pos_weight, 1.0, 10.0))
+
+    print(f"Class balance: pos={pos_count}, neg={neg_count}, pos_weight={pos_weight:.2f}")
+
+
+    pos_weight_tensor = torch.tensor(pos_weight, device=device)
+
+
+    if args.loss_name == "dice":
+        criterion = DiceLoss()
+    elif args.loss_name == "bce_dice":
+        criterion = BCEDiceLoss(
+            bce_weight=args.bce_weight,
+            pos_weight=pos_weight_tensor
+        )
     elif args.loss_name == "focal_dice":
         criterion = FocalDiceLoss(
             focal_weight=args.focal_weight,
@@ -623,12 +990,12 @@ def main(args):
         )
     else:
         raise ValueError(
-            f"Unsupported loss_name='{args.loss_name}'. Use 'bce_dice' or 'focal_dice'."
+            f"Unsupported loss_name='{args.loss_name}'. Use 'dice', 'bce_dice' or 'focal_dice'."
         )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", patience=2, factor=0.5
+        optimizer, mode="max", patience=5, factor=0.5
     )
 
     best_path = out_dir / f"best_{args.model_name}_oscd.pt"
@@ -645,7 +1012,7 @@ def main(args):
             {
                 "model_name": args.model_name,
                 "dataset_name": args.dataset_name,
-                "device": "cpu",
+                "device": str(device),
                 "baseline": "true" if args.run_name.startswith("baseline") else "false",
             }
         )
@@ -668,16 +1035,19 @@ def main(args):
                 "seed": args.seed,
                 "model_name": args.model_name,
                 "dataset_name": args.dataset_name,
+                "use_attention": args.use_attention,
+                "use_hybrid": args.use_hybrid,
             }
         )
 
-        early_stopping = EarlyStopping(patience=10, min_delta=0.001)
+        early_stopping = EarlyStopping(patience=7, min_delta=0.002)
 
         epoch = 0
+        best_score = -1.0
         for epoch in range(1, args.epochs + 1):
             train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
             val_metrics = evaluate(model, val_loader, criterion, device, max_vis=0)
-            scheduler.step(val_metrics["loss"])
+            scheduler.step(val_metrics["dice"])
             lr_now = optimizer.param_groups[0]["lr"]
 
             print(
@@ -703,7 +1073,6 @@ def main(args):
                     "val_dice": val_metrics["dice"],
                     "val_precision": val_metrics["precision"],
                     "val_recall": val_metrics["recall"],
-                    "val_f1": val_metrics["f1"],
                     "val_pixel_accuracy": val_metrics["pixel_accuracy"],
                     "learning_rate": lr_now,
                 },
@@ -721,7 +1090,9 @@ def main(args):
             }
             torch.save(checkpoint, last_path)
 
-            if val_metrics["loss"] < best_val_loss:
+            score = (val_metrics["dice"] + val_metrics["iou"]) / 2
+            if score > best_score:
+                best_score = score
                 best_val_loss = val_metrics["loss"]
                 best_val_iou = val_metrics["iou"]
                 best_val_dice = val_metrics["dice"]
@@ -729,11 +1100,11 @@ def main(args):
                 torch.save(checkpoint, best_path)
                 print(f"  => Saved new best model (epoch {epoch})")
 
-            if early_stopping.step(val_metrics["loss"], epoch):
+            if early_stopping.step(-val_metrics["dice"], epoch):
                 print(
                     f"Early stopping at epoch {epoch:03d}. "
                     f"Best epoch: {early_stopping.best_epoch:03d}, "
-                    f"val_loss={early_stopping.best_loss:.4f}"
+                    f"val_negative_dice={early_stopping.best_loss:.4f}"
                 )
                 break
 
@@ -751,9 +1122,15 @@ def main(args):
         model.load_state_dict(best_ckpt["model_state_dict"])
         model.eval()
 
+        best_threshold = 0.4
+
         final_eval = evaluate(
-            model, val_loader, criterion, device,
-            threshold=0.5, max_vis=3,
+            model,
+            val_loader,
+            criterion,
+            device,
+            threshold=best_threshold,
+            max_vis=3,
         )
 
         curves_path = artifact_dir / "training_curves.png"
@@ -764,26 +1141,12 @@ def main(args):
         save_confusion_matrix(final_eval["confusion"], confusion_path)
         save_prediction_visuals(final_eval["vis_samples"], pred_dir)
 
-        if args.do_threshold_sweep:
-            sweep_results = threshold_sweep(
-                model, val_loader, criterion, device,
-                thresholds=args.thresholds,
-            )
-            sweep_path = artifact_dir / "threshold_sweep.csv"
-            with open(sweep_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=list(sweep_results[0].keys()))
-                writer.writeheader()
-                writer.writerows(sweep_results)
-            mlflow.log_artifact(str(sweep_path))
-            print(f"Threshold sweep saved to {sweep_path}")
-
         mlflow.log_artifact(str(best_path))
         mlflow.log_artifact(str(last_path))
         mlflow.log_artifact(str(curves_path))
         mlflow.log_artifact(str(confusion_path))
         mlflow.log_artifacts(str(pred_dir), artifact_path="predictions")
-        mlflow.pytorch.log_model(model, artifact_path="model")
-
+        # mlflow.pytorch.log_model(model, artifact_path="model")
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -791,7 +1154,7 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Train U-Net or SiamDiff on OSCD RGB with MLflow logging (CPU only)"
+        description="Train U-Net or SiamDiff or pretrained resnet encoder on OSCD RGB with MLflow logging (CPU only)"
     )
 
     # Data
@@ -805,6 +1168,26 @@ if __name__ == "__main__":
         choices=["none", "flip", "flip_rot90", "strong"],
         help="Augmentation mode: none | flip | flip_rot90 | strong (flip_rot90 + photometric)",
     )
+    parser.add_argument("--mode", type=str, default="train",
+                        choices=["train", "zeroshot", "finetune"])
+
+    parser.add_argument("--checkpoint-path", type=str, default=None,
+                        help="Putanja do pretrained/best checkpointa za zero-shot ili finetune.")
+
+    parser.add_argument("--local-data-dir", type=str, default=None,
+                        help="Root direktorijum lokalnog dataseta sa t1/t2/labels.")
+
+    parser.add_argument("--local-train-dir", type=str, default=None,
+                        help="Putanja do lokalnog TRAIN foldera")
+
+    parser.add_argument("--local-val-dir", type=str, default=None,
+                        help="Putanja do lokalnog VAL foldera")
+
+    parser.add_argument("--save-preds-dir", type=str, default="predictions_local",
+                        help="Gdje da sačuva zero-shot predikcije.")
+
+    parser.add_argument("--threshold", type=float, default=0.5,
+                        help="Threshold za binarnu masku.")
 
     # Training
     parser.add_argument("--batch-size", type=int, default=4)
@@ -813,26 +1196,28 @@ if __name__ == "__main__":
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--use-attention", action="store_true")
+    parser.add_argument("--use-hybrid", action="store_true")
 
     # Loss
     parser.add_argument(
         "--loss-name",
         type=str,
         default="bce_dice",
-        choices=["bce_dice", "focal_dice"],
-        help="Loss function: bce_dice | focal_dice",
+        choices=["dice", "bce_dice", "focal_dice"],
+        help="Loss function: bce_dice | focal_dice | dice",
     )
     parser.add_argument(
         "--bce-weight",
         type=float,
         default=0.5,
-        help="BCE share in BCEDiceLoss (only used when --loss-name=bce_dice)",
+        help="BCE share in BCEDiceLoss",
     )
     parser.add_argument(
         "--focal-weight",
         type=float,
         default=0.3,
-        help="Focal share in FocalDiceLoss (only used when --loss-name=focal_dice)",
+        help="Focal share in FocalDiceLoss",
     )
     parser.add_argument(
         "--focal-alpha",
@@ -851,14 +1236,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--do-threshold-sweep",
         action="store_true",
-        help="Run threshold sweep on best checkpoint after training",
+        help="Run threshold sweep on best checkpoint",
     )
     parser.add_argument(
         "--thresholds",
         type=float,
         nargs="+",
         default=[0.3, 0.4, 0.5, 0.6, 0.7],
-        help="Decision thresholds to evaluate during sweep",
+        help="Decision thresholds",
     )
 
     # MLflow / output
@@ -869,7 +1254,7 @@ if __name__ == "__main__":
         "--model-name",
         type=str,
         default="unet",
-        choices=["unet", "siamdiff"]
+        choices=["unet", "siamdiff", "unet_resnet"]
     )
     parser.add_argument("--dataset-name", type=str, default="blanchon/OSCD_RGB")
     parser.add_argument("--mlflow-tracking-uri", type=str, default="file:./mlruns")

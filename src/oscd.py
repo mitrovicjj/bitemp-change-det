@@ -7,7 +7,7 @@ import random
 
 
 class OSCDDataset(Dataset):
-    # Supported augment modes:
+    #   supported modes:
     #   none– no augmentation
     #   flip- random horizontal + vertical flip
     #   flip_rot90– flip + random rot90 (k in {0,1,2,3})
@@ -76,26 +76,37 @@ class OSCDDataset(Dataset):
     def _get_crop_coords(self, mask, h, w):
         ps = self.patch_size
 
-        # Validacija: uvijek isti crop, ponovljiv između epoha
+        # validacija: uvijek isti crop- ponovljiv između epoha
         if self.crop_mode == "center_crop":
             top = max((h - ps) // 2, 0)
             left = max((w - ps) // 2, 0)
             return top, left
 
-        # Train: 50% šanse da crop bude centriran oko stvarne promjene
+        # obuka: 50% sanse da crop bude centriran oko promjene
         if self.crop_mode == "random_crop":
             mask_np = mask.squeeze(0).numpy()
             ys, xs = np.where(mask_np > 0)
 
-            if len(xs) > 0 and random.random() < 0.5:
+            max_top = max(h - ps, 0)
+            max_left = max(w - ps, 0)
+
+            # ako postoji promjena-random crop koji sigurno sadrzi promjenu
+            if len(xs) > 0:
                 idx = random.randint(0, len(xs) - 1)
                 cy, cx = ys[idx], xs[idx]
-                top  = max(0, min(cy - ps // 2, h - ps))
-                left = max(0, min(cx - ps // 2, w - ps))
+
+                top_min = max(0, cy - ps + 1)
+                top_max = min(cy, max_top)
+
+                left_min = max(0, cx - ps + 1)
+                left_max = min(cx, max_left)
+
+                top = random.randint(top_min, top_max) if top_min <= top_max else 0
+                left = random.randint(left_min, left_max) if left_min <= left_max else 0
                 return top, left
 
-            top  = random.randint(0, max(h - ps, 0))
-            left = random.randint(0, max(w - ps, 0))
+            top = random.randint(0, max_top)
+            left = random.randint(0, max_left)
             return top, left
 
         raise ValueError(f"Unsupported crop_mode='{self.crop_mode}'")
@@ -145,7 +156,7 @@ class OSCDDataset(Dataset):
         return t1, t2, mask
 
     def __getitem__(self, idx):
-        real_idx = idx % len(self.ds)   # mapira virtualni idx na pravu sliku
+        real_idx = idx % len(self.ds)
         item = self.ds[real_idx]
 
         t1 = self._to_tensor_image(item["image1"])
