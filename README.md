@@ -1,50 +1,71 @@
 # Deep Learning for Infrastructure Change Detection
 
-A geospatial AI project for monitoring infrastructure changes over time using satellite imagery, OpenStreetMap data, and deep learning.
+A geospatial deep learning project for detecting infrastructure changes in urban and industrial areas using bi-temporal Sentinel-2 imagery and the OSCD benchmark.
 
-The project is focused on practical change monitoring use cases such as new construction, building expansion and urban land-use changes. It combines geospatial preprocessing, mask generation from OSM and bi-temporal image analysis to produce clean, interpretable change maps.
+## Functionalities
 
-## What the project does
+- Detects pixel-level changes between two Sentinel-2 satellite images (T1/T2)
+- Trains and evaluates multiple U-Net architectures for binary change mask prediction
+- Supports both the public OSCD benchmark and a custom local dataset
+- Tracks experiments with MLflow (metrics, configs, visualizations)
 
-- Detects infrastructure changes between two satellite images of the same area.
-- Generates binary change masks and visual overlays.
-- Uses OSM building data as a geospatial reference signal.
-- Validates spatial alignment through raster export and QGIS review.
-- Builds toward a Siamese U-Net baseline on the OSCD benchmark.
+## Datasets
 
-## Why that's important
+**OSCD** — Onera Satellite Change Detection benchmark; 24 bi-temporal Sentinel-2 image pairs from 14 cities (2015–2018), pixel-level binary change labels. RGB variant used (via Hugging Face) to align with ImageNet-pretrained encoder.
 
-Satellite-based change detection is useful for infrastructure monitoring, urban development tracking, and land-use analysis. 
-This project is designed to support those practical workflows by turning raw imagery into spatially aligned, human-readable change maps. 
-Deep learning is helpful because satellite data is often noisy, partially occluded by clouds, affected by seasonal and lighting differences, and too large to inspect manually at scale, making learned models far better suited for robust change extraction than simple threshold-based methods.
+**Local dataset** — Custom bi-temporal Sentinel-2 scenes covering infrastructure changes in Serbia. Scenes acquired via Copernicus, annotated in QGIS. Used for domain transfer evaluation and fine-tuning.
 
-## Current progress
+## Models
 
-- Sentinel-2 + OSM test pipeline completed and tested.
-- Clean reproducible notebook prepared.
-- OSM rasterization and change mask generation working.
-- GeoTIFF export functional, QGIS validation ready.
-- OSCD benchmark training with a Siamese U-Net model.
+| Model | Description |
+|---|---|
+| Early Fusion U-Net | T1 and T2 concatenated channel-wise as input |
+| Dual Stream U-Net | Separate encoders with shared weights, features merged in decoder |
+| Pretrained U-Net (ResNet34) | ImageNet-pretrained ResNet34 encoder — best overall results |
 
-## Practical workflow
+## Results
 
-1. Load satellite imagery for two time points.
-2. Extract building data from OpenStreetMap.
-3. Rasterize vector geometries into aligned masks.
-4. Compare temporal inputs and generate a change mask.
-5. Export results for GIS validation and visual inspection.
+**OSCD benchmark:**
 
-## Example outputs
+| Model | IoU | Dice | Precision | Recall |
+|---|---|---|---|---|
+| Early Fusion | 0.167 | 0.267 | 0.41 | 0.45 |
+| Siamese | 0.174 | 0.258 | 0.54 | 0.22 |
+| Pretrained ResNet34 | 0.256 | 0.386 | 0.45 | 0.36 |
 
-- Sentinel image, OSM building mask, and change mask comparison.
-- Satellite overlay with semi-transparent change detection result.
-- Exported GeoTIFF masks for GIS review.
+**Loss function ablation (Pretrained model):**
+
+| Loss | IoU | Dice | Precision | Recall |
+|---|---|---|---|---|
+| BCE + Dice (pos_weight) | 0.257 | 0.387 | 0.454 | 0.362 |
+| Dice only | 0.201 | 0.320 | 0.426 | 0.338 |
+| Focal + Dice | 0.219 | 0.340 | 0.358 | 0.392 |
+
+**Local domain (zero-shot to fine-tuned):**
+
+| Stage | IoU | Dice |
+|---|---|---|
+| Zero-shot | 0.052 | 0.094 |
+| Fine-tuned | 0.145 | 0.238 |
+
+Experiment tracking is handled via MLflow. Results (metrics, configs, prediction visualizations) are logged locally.
 
 ## Tech stack
 
-- PyTorch
-- Rasterio
-- GeoPandas
-- OpenStreetMap / GeoFabrik
-- Google Earth Engine
-- QGIS
+- **PyTorch** + `segmentation_models_pytorch`
+- **QGIS** — annotation, visual inspection, GeoTIFF validation
+- **MLflow** — experiment tracking
+- **Hugging Face Datasets** — OSCD RGB variant
+- **Copernicus, Google Earth Engine** — data sources
+
+## Limitations & future work
+
+Current limitations include class imbalance (2–5% change pixels), limited spatial resolution of Sentinel-2, and domain shift between OSCD and local scenes. The project is constrained on hyperparameter search and model complexity.
+
+Next steps: transformer-based architectures (BIT), Sentinel-1 SAR fusion, larger local annotated dataset.
+
+## References
+
+- Daudt, R. C. et al. *Urban Change Detection for Multispectral Earth Observation Using Convolutional Neural Networks.* IGARSS.
+- Rodrigo Caye Daudt, Bertrand Le Saux, Alexandre Boulch. (2018, October). *Fully convolutional siamese networks for change detection.* IEEE.
+
